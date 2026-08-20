@@ -1,0 +1,31 @@
+name: Valorant Data Refresh
+
+on:
+  schedule:
+    # Run daily at 6 AM UTC — free unlimited minutes on public repos
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run data refresh
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          HENRIKDEV_API_KEY: ${{ secrets.HENRIKDEV_API_KEY }}
+        run: node refresh.mjs

@@ -1,0 +1,11 @@
+{
+  "name": "valorant-data-refresh",
+  "private": false,
+  "type": "module",
+  "scripts": {
+    "refresh": "node refresh.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}
