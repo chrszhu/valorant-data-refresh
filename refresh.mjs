@@ -14,10 +14,12 @@ import { Pool, types } from "pg";
 types.setTypeParser(20, (val) => parseInt(val, 10));
 types.setTypeParser(1700, (val) => parseFloat(val));
 
-const REGIONS = ["na", "eu", "ap", "kr", "br", "latam"];
+const ALL_REGIONS = ["na", "eu", "ap", "kr", "br", "latam"];
+const REGIONS = process.env.REGION ? [process.env.REGION] : ALL_REGIONS;
 const HENRIK_BASE = "https://api.henrikdev.xyz";
 const DELAY_MS = 2500;
-const MAX_PLAYERS_PER_REGION = 100;
+// No player cap — scan ALL Immortal+ players from the leaderboard
+const MAX_PLAYERS_PER_REGION = parseInt(process.env.MAX_PLAYERS || "0", 10);
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -283,9 +285,9 @@ async function main() {
     log(`  Cached ${cachedPlayers.length} leaderboard entries`);
 
     // tier >= 24 = Immortal 1 and above (Imm1=24, Imm2=25, Imm3=26, Radiant=27)
-    const players = allPlayers
-      .filter((p) => !p.is_anonymized && p.name && p.tag && p.tier >= 24)
-      .slice(0, MAX_PLAYERS_PER_REGION);
+    let players = allPlayers
+      .filter((p) => !p.is_anonymized && p.name && p.tag && p.tier >= 24);
+    if (MAX_PLAYERS_PER_REGION > 0) players = players.slice(0, MAX_PLAYERS_PER_REGION);
 
     log(`  Checking ${players.length} Immortal+ players`);
 

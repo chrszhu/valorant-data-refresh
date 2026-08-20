@@ -2,30 +2,49 @@ name: Valorant Data Refresh
 
 on:
   schedule:
-    # Run daily at 6 AM UTC — free unlimited minutes on public repos
+    # Daily at 6 AM UTC — public repo = unlimited free minutes
     - cron: '0 6 * * *'
   workflow_dispatch:
+    inputs:
+      region:
+        description: 'Single region to refresh (leave empty for all)'
+        required: false
+        type: string
 
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 120
+    strategy:
+      matrix:
+        region: [na, eu, ap, kr, br, latam]
+      max-parallel: 1
+      fail-fast: false
 
     steps:
+      - name: Check if manual single-region run
+        if: inputs.region != '' && matrix.region != inputs.region
+        run: echo "Skipping ${{ matrix.region }} (manual run for ${{ inputs.region }} only)" && exit 0
+
       - name: Checkout repository
+        if: inputs.region == '' || matrix.region == inputs.region
         uses: actions/checkout@v4
 
       - name: Setup Node.js
+        if: inputs.region == '' || matrix.region == inputs.region
         uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
 
       - name: Install dependencies
+        if: inputs.region == '' || matrix.region == inputs.region
         run: npm ci
 
-      - name: Run data refresh
+      - name: Refresh ${{ matrix.region }}
+        if: inputs.region == '' || matrix.region == inputs.region
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           HENRIKDEV_API_KEY: ${{ secrets.HENRIKDEV_API_KEY }}
+          REGION: ${{ matrix.region }}
         run: node refresh.mjs
