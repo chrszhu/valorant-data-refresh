@@ -143,6 +143,10 @@ async function initSchema() {
       updated_at INTEGER NOT NULL DEFAULT floor(extract(epoch from now()))::integer
     )
   `);
+  // Per-player competitive tier + team rank anchor (24=Imm1 … 27=Radiant, 0=unknown)
+  await execute(`ALTER TABLE radiant_match_players ADD COLUMN IF NOT EXISTS current_tier INTEGER DEFAULT 0`).catch(() => {});
+  await execute(`ALTER TABLE team_compositions ADD COLUMN IF NOT EXISTS anchor_tier INTEGER DEFAULT 0`).catch(() => {});
+  await execute(`ALTER TABLE team_compositions ADD COLUMN IF NOT EXISTS game_start INTEGER DEFAULT 0`).catch(() => {});
 }
 
 async function setCachedLeaderboard(region, players) {
@@ -363,14 +367,21 @@ async function main() {
             }
             const imageUrl = actualPlayer.assets?.agent?.small ?? "";
 
+            // Rank capture: tracked player's tier at match time (fallback to leaderboard tier);
+            // anchor = highest-ranked player in the lobby (proxy for the match's rank level).
+            const trackedTier = actualPlayer.currenttier ?? player.tier ?? 0;
+            const rosterTiers = (match.players?.all_players ?? [])
+              .map((p) => p.currenttier ?? 0).filter((n) => n > 0);
+            const anchorTier = rosterTiers.length ? Math.max(...rosterTiers) : (player.tier ?? 0);
+
             await execute(
               `INSERT INTO radiant_match_players
                 (region, match_id, map, mode_id, game_start, total_rounds,
                  puuid, player_name, player_tag, team, won, character, agent_image_url,
                  score, kills, deaths, assists, headshots, bodyshots, legshots, damage_made,
                  c_cast, q_cast, e_cast, x_cast, econ_spent_avg, econ_loadout_avg,
-                 team_rounds_won, team_rounds_lost, patch)
-              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
+                 team_rounds_won, team_rounds_lost, patch, current_tier)
+              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)
               ON CONFLICT (match_id, puuid) DO NOTHING`,
               [
                 region, match.metadata.matchid, mapName,
@@ -387,7 +398,7 @@ async function main() {
                 actualPlayer.ability_casts?.x_cast ?? 0,
                 actualPlayer.economy?.spent?.average ?? 0,
                 actualPlayer.economy?.loadout_value?.average ?? 0,
-                teamRoundsWon, teamRoundsLost, patch,
+                teamRoundsWon, teamRoundsLost, patch, trackedTier,
               ],
             );
 
@@ -415,13 +426,13 @@ async function main() {
                 }
 
                 await execute(
-                  `INSERT INTO team_compositions (region, match_id, team, map, agents_sorted, archetype, won, patch)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                  `INSERT INTO team_compositions (region, match_id, team, map, agents_sorted, archetype, won, patch, anchor_tier, game_start)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
                    ON CONFLICT (match_id, team) DO NOTHING`,
                   [
                     region, match.metadata.matchid, side, mapName,
                     sideAgents.join(","), computeArchetype(sideAgents),
-                    sideWon ? 1 : 0, patch,
+                    sideWon ? 1 : 0, patch, anchorTier, match.metadata.game_start ?? 0,
                   ],
                 );
               }
