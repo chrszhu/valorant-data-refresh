@@ -11,10 +11,18 @@ on:
         required: false
         type: string
 
+# Only one refresh run at a time — regions share one API key/rate limit, so
+# overlapping runs would collide. A new run waits for the current one to finish.
+concurrency:
+  group: valorant-data-refresh
+  cancel-in-progress: false
+
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # Public repo = unlimited minutes; only cap is GitHub's 6h/job hard limit.
+    # 350 min gives each region room to complete a full Immortal+ scan.
+    timeout-minutes: 350
     strategy:
       matrix:
         region: [na, eu, ap, kr, br, latam]
