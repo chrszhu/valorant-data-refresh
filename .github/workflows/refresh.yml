@@ -2,59 +2,60 @@ name: Valorant Data Refresh
 
 on:
   schedule:
-    # Weekly, Monday 06:00 UTC. Keeps Neon compute usage minimal — we only need
-    # a fresh weekly snapshot, not continuous collection.
+    # Weekly, Monday 06:00 UTC. One snapshot a week over the top ~1000 players.
     - cron: '0 6 * * 1'
   workflow_dispatch:
     inputs:
-      region:
-        description: 'Single region to refresh (leave empty for all)'
+      max_players:
+        description: 'Players per region (default 1000, 0 = no cap)'
         required: false
         type: string
 
-# Only one refresh run at a time — regions share one API key/rate limit, so
-# overlapping runs would collide. A new run waits for the current one to finish.
+# Only one run at a time — all runs share the single accumulator release asset
+# and the Henrik API rate limit. A new run waits for the current one to finish.
 concurrency:
   group: valorant-data-refresh
   cancel-in-progress: false
 
+permissions:
+  contents: write # commit data/static + manage the accumulator release
+
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    # ~1000 players/region at 2.5s each ≈ 45 min of fetching. 90 min gives room
-    # for rate-limit backoff. The DB is idle during the fetch (compute suspends);
-    # only the end-of-region bulk write uses compute.
-    timeout-minutes: 90
-    strategy:
-      matrix:
-        region: [na, eu, ap, kr, br, latam]
-      max-parallel: 1
-      fail-fast: false
+    # All six regions sequentially: ~1000 players * 2.5s * 6 ≈ 4.5h of fetching.
+    # The accumulator is uploaded after each region, so a timeout only loses the
+    # in-progress region; the next run resumes. Public repo = unlimited minutes.
+    timeout-minutes: 340
 
     steps:
-      - name: Check if manual single-region run
-        if: inputs.region != '' && matrix.region != inputs.region
-        run: echo "Skipping ${{ matrix.region }} (manual run for ${{ inputs.region }} only)" && exit 0
-
       - name: Checkout repository
-        if: inputs.region == '' || matrix.region == inputs.region
         uses: actions/checkout@v4
 
       - name: Setup Node.js
-        if: inputs.region == '' || matrix.region == inputs.region
         uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
 
       - name: Install dependencies
-        if: inputs.region == '' || matrix.region == inputs.region
         run: npm ci
 
-      - name: Refresh ${{ matrix.region }}
-        if: inputs.region == '' || matrix.region == inputs.region
+      - name: Refresh data + build static bundles
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
           HENRIKDEV_API_KEY: ${{ secrets.HENRIKDEV_API_KEY }}
-          REGION: ${{ matrix.region }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MAX_PLAYERS: ${{ inputs.max_players }}
         run: node refresh.mjs
+
+      - name: Commit static bundles
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/static
+          if git diff --cached --quiet; then
+            echo "No bundle changes to commit"
+          else
+            git commit -m "Weekly data refresh: update static bundles"
+            git push
+          fi
