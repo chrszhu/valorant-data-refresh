@@ -18,8 +18,12 @@ const ALL_REGIONS = ["na", "eu", "ap", "kr", "br", "latam"];
 const REGIONS = process.env.REGION ? [process.env.REGION] : ALL_REGIONS;
 const HENRIK_BASE = "https://api.henrikdev.xyz";
 const DELAY_MS = 2500;
-// No player cap — scan ALL Immortal+ players from the leaderboard
-const MAX_PLAYERS_PER_REGION = parseInt(process.env.MAX_PLAYERS || "0", 10);
+// Player cap per region. IMPORTANT: this is bounded on purpose. Scanning every
+// Immortal+ player kept the run (and therefore the Neon compute) active for
+// 30-50h, which exhausted the free-tier compute quota. A moderate cap keeps each
+// run short while still pulling hundreds of fresh matches/region/day. Raise via
+// the MAX_PLAYERS env var only if you move Neon off the free tier. 0 = no cap.
+const MAX_PLAYERS_PER_REGION = parseInt(process.env.MAX_PLAYERS || "400", 10);
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -135,6 +139,23 @@ async function execute(sql, params = []) {
   await getPool().query(sql, params);
 }
 
+// Bulk multi-row insert. Keeps the DB compute active for only a short burst
+// (vs. one round-trip per row), so it can auto-suspend the rest of the run.
+async function bulkInsert(table, cols, rows, conflictClause = "") {
+  if (!rows.length) return;
+  const CHUNK = 500; // 500 * ~31 cols < 65535 param cap
+  for (let i = 0; i < rows.length; i += CHUNK) {
+    const chunk = rows.slice(i, i + CHUNK);
+    const values = chunk
+      .map((_, r) => `(${cols.map((__, c) => `$${r * cols.length + c + 1}`).join(",")})`)
+      .join(",");
+    await execute(
+      `INSERT INTO ${table} (${cols.join(",")}) VALUES ${values} ${conflictClause}`,
+      chunk.flat(),
+    );
+  }
+}
+
 async function initSchema() {
   await execute(`
     CREATE TABLE IF NOT EXISTS cached_leaderboards (
@@ -216,33 +237,34 @@ async function rebuildStats(region) {
   await execute("DELETE FROM agent_map_stats WHERE region = $1", [region]);
   const now = Math.floor(Date.now() / 1000);
 
+  const statRows = [];
   for (const [map, agents] of Object.entries(acc)) {
     for (const [agent, { games, wins }] of Object.entries(agents)) {
       const p = perf[`${map}::${agent}`];
-      await execute(
-        `INSERT INTO agent_map_stats
-          (region, map, agent, agent_image_url, games, wins,
-           total_rounds, total_damage, total_score,
-           total_hs, total_bs, total_ls,
-           total_c_casts, total_q_casts, total_e_casts, total_x_casts,
-           total_econ_spent, total_loadout_value, updated_at, patch)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
-        ON CONFLICT (region, map, agent) DO NOTHING`,
-        [
-          region, map, agent, imageMap[agent] ?? "",
-          games, wins,
-          parseInt(p?.rds ?? "0", 10), parseInt(p?.dmg ?? "0", 10),
-          parseInt(p?.sc ?? "0", 10),
-          parseInt(p?.hs ?? "0", 10), parseInt(p?.bs ?? "0", 10),
-          parseInt(p?.ls ?? "0", 10),
-          parseFloat(p?.cc ?? "0"), parseFloat(p?.qc ?? "0"),
-          parseFloat(p?.ec ?? "0"), parseFloat(p?.xc ?? "0"),
-          parseFloat(p?.esp ?? "0"), parseFloat(p?.elv ?? "0"),
-          now, "current",
-        ],
-      );
+      statRows.push([
+        region, map, agent, imageMap[agent] ?? "",
+        games, wins,
+        parseInt(p?.rds ?? "0", 10), parseInt(p?.dmg ?? "0", 10),
+        parseInt(p?.sc ?? "0", 10),
+        parseInt(p?.hs ?? "0", 10), parseInt(p?.bs ?? "0", 10),
+        parseInt(p?.ls ?? "0", 10),
+        parseFloat(p?.cc ?? "0"), parseFloat(p?.qc ?? "0"),
+        parseFloat(p?.ec ?? "0"), parseFloat(p?.xc ?? "0"),
+        parseFloat(p?.esp ?? "0"), parseFloat(p?.elv ?? "0"),
+        now, "current",
+      ]);
     }
   }
+  await bulkInsert(
+    "agent_map_stats",
+    ["region", "map", "agent", "agent_image_url", "games", "wins",
+      "total_rounds", "total_damage", "total_score",
+      "total_hs", "total_bs", "total_ls",
+      "total_c_casts", "total_q_casts", "total_e_casts", "total_x_casts",
+      "total_econ_spent", "total_loadout_value", "updated_at", "patch"],
+    statRows,
+    "ON CONFLICT (region, map, agent) DO NOTHING",
+  );
 
   log(`  Stats rebuilt: ${Object.keys(acc).length} maps`);
 }
@@ -288,6 +310,15 @@ async function main() {
     await setCachedLeaderboard(region, cachedPlayers);
     log(`  Cached ${cachedPlayers.length} leaderboard entries`);
 
+    // Load already-stored match IDs ONCE so the fetch loop needs zero DB calls.
+    // This lets the Neon compute auto-suspend during the long API fetch.
+    const existingRows = await query(
+      "SELECT DISTINCT match_id FROM radiant_match_players WHERE region = $1",
+      [region],
+    );
+    const existingIds = new Set(existingRows.map((r) => r.match_id));
+    log(`  ${existingIds.size} matches already stored for ${region}`);
+
     // tier >= 24 = Immortal 1 and above (Imm1=24, Imm2=25, Imm3=26, Radiant=27)
     let players = allPlayers
       .filter((p) => !p.is_anonymized && p.name && p.tag && p.tier >= 24);
@@ -297,6 +328,10 @@ async function main() {
 
     let regionMatches = 0;
     let playersChecked = 0;
+    // In-memory buffers — flushed to the DB in one bulk write after the fetch.
+    const playerBuf = [];
+    const compBuf = [];
+    const seen = new Set(); // new match IDs buffered this run (avoid dupes)
 
     for (const player of players) {
       try {
@@ -320,6 +355,11 @@ async function main() {
             )
               continue;
 
+            const matchId = match.metadata.matchid;
+            // Skip matches already in the DB or already buffered this run — no
+            // per-match DB round-trip (that's what kept the compute pinned).
+            if (existingIds.has(matchId) || seen.has(matchId)) continue;
+
             const mapName = match.metadata.map;
             const patch = extractPatch(match.metadata.game_version ?? "");
 
@@ -334,11 +374,7 @@ async function main() {
             const teamResults = match.teams ?? {};
             if (!teamResults[team]) continue;
 
-            const existing = await query(
-              "SELECT 1 FROM radiant_match_players WHERE match_id = $1 AND puuid = $2",
-              [match.metadata.matchid, actualPlayer.puuid],
-            );
-            if (existing.length > 0) continue;
+            seen.add(matchId);
 
             let won = false;
             let teamRoundsWon = 0;
@@ -374,35 +410,25 @@ async function main() {
               .map((p) => p.currenttier ?? 0).filter((n) => n > 0);
             const anchorTier = rosterTiers.length ? Math.max(...rosterTiers) : (player.tier ?? 0);
 
-            await execute(
-              `INSERT INTO radiant_match_players
-                (region, match_id, map, mode_id, game_start, total_rounds,
-                 puuid, player_name, player_tag, team, won, character, agent_image_url,
-                 score, kills, deaths, assists, headshots, bodyshots, legshots, damage_made,
-                 c_cast, q_cast, e_cast, x_cast, econ_spent_avg, econ_loadout_avg,
-                 team_rounds_won, team_rounds_lost, patch, current_tier)
-              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)
-              ON CONFLICT (match_id, puuid) DO NOTHING`,
-              [
-                region, match.metadata.matchid, mapName,
-                match.metadata.mode_id, match.metadata.game_start, rounds,
-                actualPlayer.puuid, player.name, player.tag,
-                team, won ? 1 : 0, actualPlayer.character, imageUrl,
-                actualPlayer.stats.score, actualPlayer.stats.kills,
-                actualPlayer.stats.deaths, actualPlayer.stats.assists,
-                actualPlayer.stats.headshots, actualPlayer.stats.bodyshots,
-                actualPlayer.stats.legshots, actualPlayer.damage_made ?? 0,
-                actualPlayer.ability_casts?.c_cast ?? 0,
-                actualPlayer.ability_casts?.q_cast ?? 0,
-                actualPlayer.ability_casts?.e_cast ?? 0,
-                actualPlayer.ability_casts?.x_cast ?? 0,
-                actualPlayer.economy?.spent?.average ?? 0,
-                actualPlayer.economy?.loadout_value?.average ?? 0,
-                teamRoundsWon, teamRoundsLost, patch, trackedTier,
-              ],
-            );
+            playerBuf.push([
+              region, matchId, mapName,
+              match.metadata.mode_id, match.metadata.game_start, rounds,
+              actualPlayer.puuid, player.name, player.tag,
+              team, won ? 1 : 0, actualPlayer.character, imageUrl,
+              actualPlayer.stats.score, actualPlayer.stats.kills,
+              actualPlayer.stats.deaths, actualPlayer.stats.assists,
+              actualPlayer.stats.headshots, actualPlayer.stats.bodyshots,
+              actualPlayer.stats.legshots, actualPlayer.damage_made ?? 0,
+              actualPlayer.ability_casts?.c_cast ?? 0,
+              actualPlayer.ability_casts?.q_cast ?? 0,
+              actualPlayer.ability_casts?.e_cast ?? 0,
+              actualPlayer.ability_casts?.x_cast ?? 0,
+              actualPlayer.economy?.spent?.average ?? 0,
+              actualPlayer.economy?.loadout_value?.average ?? 0,
+              teamRoundsWon, teamRoundsLost, patch, trackedTier,
+            ]);
 
-            // Insert team compositions for both sides
+            // Buffer team compositions for both sides
             if (
               teamResults.red &&
               teamResults.blue &&
@@ -425,16 +451,11 @@ async function main() {
                   sideWon = teamResults[side]?.has_won ?? false;
                 }
 
-                await execute(
-                  `INSERT INTO team_compositions (region, match_id, team, map, agents_sorted, archetype, won, patch, anchor_tier, game_start)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-                   ON CONFLICT (match_id, team) DO NOTHING`,
-                  [
-                    region, match.metadata.matchid, side, mapName,
-                    sideAgents.join(","), computeArchetype(sideAgents),
-                    sideWon ? 1 : 0, patch, anchorTier, match.metadata.game_start ?? 0,
-                  ],
-                );
+                compBuf.push([
+                  region, matchId, side, mapName,
+                  sideAgents.join(","), computeArchetype(sideAgents),
+                  sideWon ? 1 : 0, patch, anchorTier, match.metadata.game_start ?? 0,
+                ]);
               }
             }
 
@@ -464,6 +485,27 @@ async function main() {
     log(
       `  ✓ ${region.toUpperCase()}: ${playersChecked} players, ${regionMatches} new matches`,
     );
+
+    // Single bulk write for the whole region — the only heavy DB activity of the
+    // run. The compute was idle (and auto-suspended) during the fetch above.
+    log(`  Flushing ${playerBuf.length} player rows + ${compBuf.length} comp rows...`);
+    await bulkInsert(
+      "radiant_match_players",
+      ["region", "match_id", "map", "mode_id", "game_start", "total_rounds",
+        "puuid", "player_name", "player_tag", "team", "won", "character", "agent_image_url",
+        "score", "kills", "deaths", "assists", "headshots", "bodyshots", "legshots", "damage_made",
+        "c_cast", "q_cast", "e_cast", "x_cast", "econ_spent_avg", "econ_loadout_avg",
+        "team_rounds_won", "team_rounds_lost", "patch", "current_tier"],
+      playerBuf,
+      "ON CONFLICT (match_id, puuid) DO NOTHING",
+    );
+    await bulkInsert(
+      "team_compositions",
+      ["region", "match_id", "team", "map", "agents_sorted", "archetype", "won", "patch", "anchor_tier", "game_start"],
+      compBuf,
+      "ON CONFLICT (match_id, team) DO NOTHING",
+    );
+
     await rebuildStats(region);
     totalMatches += regionMatches;
   }

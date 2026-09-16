@@ -20,9 +20,10 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    # Public repo = unlimited minutes; only cap is GitHub's 6h/job hard limit.
-    # 350 min gives each region room to complete a full Immortal+ scan.
-    timeout-minutes: 350
+    # A capped scan (~400 players/region) fetches in ~15-20 min. 60 min is ample
+    # headroom for rate-limit backoff. Runs are intentionally short so the Neon
+    # compute stays mostly suspended and we don't blow the free-tier quota.
+    timeout-minutes: 60
     strategy:
       matrix:
         region: [na, eu, ap, kr, br, latam]
