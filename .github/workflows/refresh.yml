@@ -2,8 +2,9 @@ name: Valorant Data Refresh
 
 on:
   schedule:
-    # Daily at 6 AM UTC — public repo = unlimited free minutes
-    - cron: '0 6 * * *'
+    # Weekly, Monday 06:00 UTC. Keeps Neon compute usage minimal — we only need
+    # a fresh weekly snapshot, not continuous collection.
+    - cron: '0 6 * * 1'
   workflow_dispatch:
     inputs:
       region:
@@ -20,10 +21,10 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    # A capped scan (~400 players/region) fetches in ~15-20 min. 60 min is ample
-    # headroom for rate-limit backoff. Runs are intentionally short so the Neon
-    # compute stays mostly suspended and we don't blow the free-tier quota.
-    timeout-minutes: 60
+    # ~1000 players/region at 2.5s each ≈ 45 min of fetching. 90 min gives room
+    # for rate-limit backoff. The DB is idle during the fetch (compute suspends);
+    # only the end-of-region bulk write uses compute.
+    timeout-minutes: 90
     strategy:
       matrix:
         region: [na, eu, ap, kr, br, latam]

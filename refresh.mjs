@@ -18,12 +18,13 @@ const ALL_REGIONS = ["na", "eu", "ap", "kr", "br", "latam"];
 const REGIONS = process.env.REGION ? [process.env.REGION] : ALL_REGIONS;
 const HENRIK_BASE = "https://api.henrikdev.xyz";
 const DELAY_MS = 2500;
-// Player cap per region. IMPORTANT: this is bounded on purpose. Scanning every
-// Immortal+ player kept the run (and therefore the Neon compute) active for
-// 30-50h, which exhausted the free-tier compute quota. A moderate cap keeps each
-// run short while still pulling hundreds of fresh matches/region/day. Raise via
-// the MAX_PLAYERS env var only if you move Neon off the free tier. 0 = no cap.
-const MAX_PLAYERS_PER_REGION = parseInt(process.env.MAX_PLAYERS || "400", 10);
+// Top N players per region (by leaderboard rank). Bounded on purpose: scanning
+// every Immortal+ player kept the run (and the Neon compute) active for 30-50h
+// and blew the free-tier quota. Weekly run over the top ~1000 players is plenty.
+// Override with the MAX_PLAYERS env var. 0 = no cap.
+const MAX_PLAYERS_PER_REGION = parseInt(process.env.MAX_PLAYERS || "1000", 10);
+// Recent competitive matches to pull per player (Henrik allows up to ~20).
+const MATCHES_PER_PLAYER = parseInt(process.env.MATCHES_PER_PLAYER || "20", 10);
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -336,7 +337,7 @@ async function main() {
     for (const player of players) {
       try {
         const matchRes = await safeFetch(
-          `${HENRIK_BASE}/valorant/v3/matches/${region}/${encodeURIComponent(player.name)}/${encodeURIComponent(player.tag)}?filter=competitive&size=10`,
+          `${HENRIK_BASE}/valorant/v3/matches/${region}/${encodeURIComponent(player.name)}/${encodeURIComponent(player.tag)}?filter=competitive&size=${MATCHES_PER_PLAYER}`,
         );
 
         if (!matchRes || !matchRes.ok) {
