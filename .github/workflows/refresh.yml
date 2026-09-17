@@ -2,12 +2,13 @@ name: Valorant Data Refresh
 
 on:
   schedule:
-    # Weekly, Monday 06:00 UTC. One snapshot a week over the top ~1000 players.
-    - cron: '0 6 * * 1'
+    # Daily, 06:00 UTC. Keeps the meta up to date within a day. The accumulator
+    # dedups matches and auto-prunes old ones, so daily runs stay cheap + bounded.
+    - cron: '0 6 * * *'
   workflow_dispatch:
     inputs:
       max_players:
-        description: 'Players per region (default 1000, 0 = no cap)'
+        description: 'Players per region (default 500, 0 = no cap)'
         required: false
         type: string
 
@@ -45,7 +46,8 @@ jobs:
         env:
           HENRIKDEV_API_KEY: ${{ secrets.HENRIKDEV_API_KEY }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MAX_PLAYERS: ${{ inputs.max_players }}
+          # Scheduled runs use 500; manual runs can override via the input.
+          MAX_PLAYERS: ${{ inputs.max_players || '500' }}
         run: node refresh.mjs
 
       - name: Commit static bundles
@@ -56,6 +58,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No bundle changes to commit"
           else
-            git commit -m "Weekly data refresh: update static bundles"
+            git commit -m "Daily data refresh: update static bundles"
+            git pull --rebase --autostash origin main || true
             git push
           fi

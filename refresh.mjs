@@ -47,6 +47,11 @@ const DELAY_MS = 2500;
 const MAX_PLAYERS_PER_REGION = parseInt(process.env.MAX_PLAYERS || "1000", 10);
 const MATCHES_PER_PLAYER = parseInt(process.env.MATCHES_PER_PLAYER || "20", 10);
 const COMPUTE_ONLY = process.env.COMPUTE_ONLY === "1";
+// Drop matches older than this from the accumulator. The site only shows each
+// map's last 90 days, and we only ever collect current-rotation maps, so older
+// data is never displayed — pruning keeps the accumulator at a bounded size
+// forever, which makes running frequently sustainable. 0 = never prune.
+const PRUNE_DAYS = parseInt(process.env.PRUNE_DAYS || "120", 10);
 
 // Meta windowing + rank bands — mirrors the site's old DB logic.
 const RECENT_WINDOW_DAYS = 90;
@@ -123,6 +128,19 @@ function computeArchetype(agents) {
 
 function emptyAccumulator() {
   return { players: [], comps: [], leaderboards: {} };
+}
+
+// Drop matches older than PRUNE_DAYS so the accumulator stays bounded even when
+// runs are frequent. Seed data (retired maps) is separate and never touched.
+function pruneAccumulator(acc) {
+  if (PRUNE_DAYS <= 0) return;
+  const cutoff = Math.floor(Date.now() / 1000) - PRUNE_DAYS * 86400;
+  const bp = acc.players.length, bc = acc.comps.length;
+  acc.players = acc.players.filter((p) => (p.game_start || 0) >= cutoff);
+  acc.comps = acc.comps.filter((c) => (c.game_start || 0) >= cutoff);
+  if (acc.players.length !== bp || acc.comps.length !== bc) {
+    log(`Pruned >${PRUNE_DAYS}d: players ${bp}->${acc.players.length}, comps ${bc}->${acc.comps.length}`);
+  }
 }
 
 function downloadAccumulator() {
@@ -566,6 +584,7 @@ async function main() {
   log(`Regions: ${REGIONS.join(", ")} | COMPUTE_ONLY=${COMPUTE_ONLY}`);
 
   const acc = downloadAccumulator();
+  pruneAccumulator(acc);
 
   if (!COMPUTE_ONLY) {
     const start = Date.now();
