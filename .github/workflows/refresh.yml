@@ -22,34 +22,54 @@ permissions:
   contents: write # commit data/static + manage the accumulator release
 
 jobs:
-  refresh:
+  # One job PER region so each gets its own time budget. Henrik's shared key is
+  # heavily throttled, so a single all-regions job burned its whole budget on NA
+  # and timed out before reaching the others. Sequential (max-parallel: 1) so the
+  # jobs don't race on the shared accumulator release asset.
+  fetch:
     runs-on: ubuntu-latest
-    # All six regions sequentially: ~1000 players * 2.5s * 6 ≈ 4.5h of fetching.
-    # The accumulator is uploaded after each region, so a timeout only loses the
-    # in-progress region; the next run resumes. Public repo = unlimited minutes.
-    timeout-minutes: 340
-
+    timeout-minutes: 180
+    strategy:
+      matrix:
+        region: [na, eu, ap, kr, br, latam]
+      max-parallel: 1
+      fail-fast: false
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Refresh data + build static bundles
+      - run: npm ci
+      - name: Fetch ${{ matrix.region }}
         env:
           HENRIKDEV_API_KEY: ${{ secrets.HENRIKDEV_API_KEY }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Scheduled runs use 500; manual runs can override via the input.
+          FETCH_ONLY: '1'
+          REGION: ${{ matrix.region }}
           MAX_PLAYERS: ${{ inputs.max_players || '500' }}
         run: node refresh.mjs
 
+  # Build the static bundles from the full accumulator and commit them. Runs even
+  # if some region job hit its timeout (if: always()), so we always publish
+  # whatever data was collected.
+  build:
+    needs: fetch
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - name: Build static bundles
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMPUTE_ONLY: '1'
+        run: node refresh.mjs
       - name: Commit static bundles
         run: |
           git config user.name "github-actions[bot]"

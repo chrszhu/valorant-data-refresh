@@ -47,6 +47,9 @@ const DELAY_MS = 2500;
 const MAX_PLAYERS_PER_REGION = parseInt(process.env.MAX_PLAYERS || "1000", 10);
 const MATCHES_PER_PLAYER = parseInt(process.env.MATCHES_PER_PLAYER || "20", 10);
 const COMPUTE_ONLY = process.env.COMPUTE_ONLY === "1";
+// FETCH_ONLY: pull matches into the accumulator but don't compute/write bundles.
+// Used by the per-region matrix jobs; a final COMPUTE_ONLY job builds the bundles.
+const FETCH_ONLY = process.env.FETCH_ONLY === "1";
 // Drop matches older than this from the accumulator. The site only shows each
 // map's last 90 days, and we only ever collect current-rotation maps, so older
 // data is never displayed — pruning keeps the accumulator at a bounded size
@@ -144,11 +147,8 @@ function pruneAccumulator(acc) {
 }
 
 function downloadAccumulator() {
-  if (COMPUTE_ONLY) {
-    if (existsSync(ACC_FILE)) return loadAccumulatorFile();
-    log("COMPUTE_ONLY: no local accumulator, starting empty");
-    return emptyAccumulator();
-  }
+  // Try the release first (works in CI for every mode). Fall back to a local
+  // file (local testing), else start empty.
   try {
     execSync(`gh release download ${RELEASE_TAG} -p accumulator.json.gz -O "${ACC_FILE}" --clobber`, {
       stdio: "pipe", cwd: ROOT,
@@ -156,7 +156,11 @@ function downloadAccumulator() {
     log("Downloaded accumulator from release");
     return loadAccumulatorFile();
   } catch {
-    log("No existing accumulator release — starting empty");
+    if (existsSync(ACC_FILE)) {
+      log("Using local accumulator.json.gz");
+      return loadAccumulatorFile();
+    }
+    log("No accumulator (release or local) — starting empty");
     return emptyAccumulator();
   }
 }
@@ -599,8 +603,10 @@ async function main() {
     log(`\nFetched ${total} new matches in ${((Date.now() - start) / 60000).toFixed(1)} min`);
   }
 
-  log("\nComputing static bundles...");
-  writeBundles(acc);
+  if (!FETCH_ONLY) {
+    log("\nComputing static bundles...");
+    writeBundles(acc);
+  }
 
   log("\nDone!");
 }
