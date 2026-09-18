@@ -11,9 +11,14 @@ on:
         description: 'Players per region (default 500, 0 = no cap)'
         required: false
         type: string
+      attempt:
+        description: 'Internal: auto-continue pass counter (leave blank)'
+        required: false
+        type: string
 
 # Only one run at a time — all runs share the single accumulator release asset
-# and the Henrik API rate limit. A new run waits for the current one to finish.
+# and the Henrik API rate limit. A new run (including an auto-continue) waits for
+# the current one to finish, then resumes from the saved accumulator.
 concurrency:
   group: valorant-data-refresh
   cancel-in-progress: false
@@ -22,13 +27,14 @@ permissions:
   contents: write # commit data/static + manage the accumulator release
 
 jobs:
-  # One job PER region so each gets its own time budget. Henrik's shared key is
+  # One job PER region so each gets its own ~6h budget. Henrik's shared key is
   # heavily throttled, so a single all-regions job burned its whole budget on NA
   # and timed out before reaching the others. Sequential (max-parallel: 1) so the
-  # jobs don't race on the shared accumulator release asset.
+  # jobs don't race on the shared accumulator release asset. Progress is
+  # checkpointed to the release every 50 players, so a timeout never loses work.
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 350 # just under GitHub's hard 6h per-job cap
     strategy:
       matrix:
         region: [na, eu, ap, kr, br, latam]
@@ -52,7 +58,7 @@ jobs:
 
   # Build the static bundles from the full accumulator and commit them. Runs even
   # if some region job hit its timeout (if: always()), so we always publish
-  # whatever data was collected.
+  # whatever data was collected this pass.
   build:
     needs: fetch
     if: always()
@@ -78,7 +84,35 @@ jobs:
           if git diff --cached --quiet; then
             echo "No bundle changes to commit"
           else
-            git commit -m "Daily data refresh: update static bundles"
+            git commit -m "Data refresh: update static bundles"
             git pull --rebase --autostash origin main || true
             git push
           fi
+
+  # Auto-continue: if ANY region didn't finish within its budget (timed out),
+  # start a fresh run to pick up where we left off (the accumulator + per-50
+  # checkpoints mean it resumes, not restarts). Loops until a pass where every
+  # region completes, then stops — the daily schedule takes over from there.
+  # Capped at 8 passes as a runaway guard. Requires a GH_PAT secret because the
+  # default GITHUB_TOKEN is not allowed to trigger another workflow run.
+  continue:
+    needs: [fetch, build]
+    if: always() && needs.fetch.result != 'success' && fromJSON(inputs.attempt || '1') < 8
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Continue unfinished work
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::No GH_PAT secret set — can't auto-continue. The daily"
+            echo "::warning::schedule will resume the remaining work instead."
+            exit 0
+          fi
+          next=$(( ${{ inputs.attempt || '1' }} + 1 ))
+          echo "A region did not finish within its budget — continuing (pass $next)."
+          gh workflow run refresh.yml \
+            -f max_players="${{ inputs.max_players || '500' }}" \
+            -f attempt="$next" \
+            -R "${{ github.repository }}"
