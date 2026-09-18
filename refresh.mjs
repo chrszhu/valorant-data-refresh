@@ -81,25 +81,39 @@ function getHeaders() {
   return headers;
 }
 
-async function safeFetch(url, maxAttempts = 5) {
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+// A 429 is NOT a failure — it just means "come back later". We wait out the
+// server's reset window and retry indefinitely (bounded only by the per-region
+// job timeout), so throttling slows us down but never drops data. Only real
+// network errors count toward the give-up limit.
+async function safeFetch(url, maxNetErrors = 5) {
+  let netErrors = 0;
+  let throttleWaits = 0;
+  for (;;) {
     await sleep(DELAY_MS);
     try {
       const res = await fetch(url, { headers: getHeaders(), cache: "no-store" });
       if (res.status === 429) {
-        const resetSec = parseInt(res.headers.get("x-ratelimit-reset") || "60", 10);
-        log(`  Rate limited (${attempt}/${maxAttempts}). Waiting ${resetSec + 5}s...`);
-        await sleep((resetSec + 5) * 1000);
+        throttleWaits++;
+        // Prefer the server's own hints; fall back to a growing wait so a long
+        // throttle backs off instead of hammering (10s → 20s → … capped 120s).
+        const retryAfter = parseInt(res.headers.get("retry-after") || "0", 10);
+        const resetSec = parseInt(res.headers.get("x-ratelimit-reset") || "0", 10);
+        const waitSec = Math.min(
+          Math.max(retryAfter, resetSec, Math.min(10 * throttleWaits, 120)) + 5,
+          125,
+        );
+        log(`  Rate limited (wait #${throttleWaits}). Sleeping ${waitSec}s...`);
+        await sleep(waitSec * 1000);
         continue;
       }
       return res;
     } catch (err) {
-      log(`  Fetch error (${attempt}/${maxAttempts}): ${err.message}`);
-      if (attempt === maxAttempts) return null;
-      await sleep(5000);
+      netErrors++;
+      log(`  Network error (${netErrors}/${maxNetErrors}): ${err.message}`);
+      if (netErrors >= maxNetErrors) return null;
+      await sleep(5000 * netErrors); // linear backoff on transient network errors
     }
   }
-  return null;
 }
 
 function extractPatch(gameVersion) {
