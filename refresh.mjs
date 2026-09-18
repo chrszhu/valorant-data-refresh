@@ -46,6 +46,10 @@ const HENRIK_BASE = "https://api.henrikdev.xyz";
 const DELAY_MS = 2500;
 const MAX_PLAYERS_PER_REGION = parseInt(process.env.MAX_PLAYERS || "1000", 10);
 const MATCHES_PER_PLAYER = parseInt(process.env.MATCHES_PER_PLAYER || "20", 10);
+// Save + upload the accumulator mid-region every N players so a job killed
+// partway through only loses the last few players, not the whole region. The
+// next run resumes from here (dedupe skips already-stored matches).
+const CHECKPOINT_EVERY = parseInt(process.env.CHECKPOINT_EVERY || "50", 10);
 const COMPUTE_ONLY = process.env.COMPUTE_ONLY === "1";
 // FETCH_ONLY: pull matches into the accumulator but don't compute/write bundles.
 // Used by the per-region matrix jobs; a final COMPUTE_ONLY job builds the bundles.
@@ -339,6 +343,12 @@ async function fetchRegion(region, acc) {
     playersChecked++;
     if (playersChecked % 25 === 0) {
       log(`  Progress: ${playersChecked}/${players.length}, ${regionMatches} new matches`);
+    }
+    // Mid-region checkpoint: persist so a timeout here doesn't throw away work.
+    if (CHECKPOINT_EVERY > 0 && playersChecked % CHECKPOINT_EVERY === 0) {
+      saveAccumulator(acc);
+      uploadAccumulator();
+      log(`  ⏱ Checkpoint saved at ${playersChecked}/${players.length}`);
     }
   }
 
