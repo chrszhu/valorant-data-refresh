@@ -50,6 +50,11 @@ const MATCHES_PER_PLAYER = parseInt(process.env.MATCHES_PER_PLAYER || "20", 10);
 // partway through only loses the last few players, not the whole region. The
 // next run resumes from here (dedupe skips already-stored matches).
 const CHECKPOINT_EVERY = parseInt(process.env.CHECKPOINT_EVERY || "50", 10);
+// Early-stop: if this many players in a row yield ZERO new matches, we've caught
+// up to already-collected data for this region — stop scanning to save API calls.
+// The first run (empty store) never triggers it; daily runs stop quickly once the
+// day's new games are in. 0 = disabled (always scan the full player list).
+const EARLY_STOP_STREAK = parseInt(process.env.EARLY_STOP_STREAK || "40", 10);
 const COMPUTE_ONLY = process.env.COMPUTE_ONLY === "1";
 // FETCH_ONLY: pull matches into the accumulator but don't compute/write bundles.
 // Used by the per-region matrix jobs; a final COMPUTE_ONLY job builds the bundles.
@@ -244,9 +249,11 @@ async function fetchRegion(region, acc) {
 
   let regionMatches = 0;
   let playersChecked = 0;
+  let zeroStreak = 0; // consecutive players with no new matches (early-stop signal)
   const seen = new Set();
 
   for (const player of players) {
+    const matchesBefore = regionMatches;
     try {
       const matchRes = await safeFetch(
         `${HENRIK_BASE}/valorant/v3/matches/${region}/${encodeURIComponent(player.name)}/${encodeURIComponent(player.tag)}?filter=competitive&size=${MATCHES_PER_PLAYER}`,
@@ -349,6 +356,16 @@ async function fetchRegion(region, acc) {
       saveAccumulator(acc);
       uploadAccumulator();
       log(`  ⏱ Checkpoint saved at ${playersChecked}/${players.length}`);
+    }
+    // Early-stop once we hit a wall of already-collected data.
+    if (regionMatches === matchesBefore) {
+      zeroStreak++;
+      if (EARLY_STOP_STREAK > 0 && zeroStreak >= EARLY_STOP_STREAK) {
+        log(`  ⏹ Caught up: ${zeroStreak} players in a row with no new matches — stopping ${region.toUpperCase()} at ${playersChecked}/${players.length}.`);
+        break;
+      }
+    } else {
+      zeroStreak = 0;
     }
   }
 
