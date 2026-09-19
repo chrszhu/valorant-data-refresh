@@ -43,7 +43,14 @@ const ALL_REGIONS = ["na", "eu", "ap", "kr", "br", "latam"];
 const OUT_REGIONS = ["all", ...ALL_REGIONS];
 const REGIONS = process.env.REGION ? [process.env.REGION] : ALL_REGIONS;
 const HENRIK_BASE = "https://api.henrikdev.xyz";
-const DELAY_MS = 2500;
+// Henrik's real limit (confirmed from response headers on the runner):
+//   ratelimit-policy: "per1min"; q=30; w=60  →  30 requests per fixed 60s window,
+//   x-ratelimit-limit=30, x-ratelimit-reset = seconds left in the current window.
+// 2100ms ≈ 28.5 req/min stays just under 30/min with headroom for clock jitter and
+// the fixed-window edge, so a DEDICATED key never self-inflicts a 429 in steady
+// state. (The 429 storms we saw come from the key being SHARED/over-subscribed;
+// pacing alone can't fix that — see README/handoff about a dedicated batch key.)
+const DELAY_MS = parseInt(process.env.DELAY_MS || "2100", 10);
 const MAX_PLAYERS_PER_REGION = parseInt(process.env.MAX_PLAYERS || "1000", 10);
 const MATCHES_PER_PLAYER = parseInt(process.env.MATCHES_PER_PLAYER || "20", 10);
 // Save + upload the accumulator mid-region every N players so a job killed
@@ -117,15 +124,17 @@ async function safeFetch(url, maxNetErrors = 5) {
       logRateLimitHeaders(res);
       if (res.status === 429) {
         throttleWaits++;
-        // Prefer the server's own hints; fall back to a growing wait so a long
-        // throttle backs off instead of hammering (10s → 20s → … capped 120s).
+        // Henrik uses a FIXED 60s window (ratelimit-policy: per1min, w=60). The
+        // only useful hint is x-ratelimit-reset = seconds left in the current
+        // window (retry-after is not sent). Once that elapses the full 30-request
+        // quota refills, so we just wait out the window (+ a small skew buffer)
+        // and retry — clamped to ~65s. No growing/120s backoff: the real reset
+        // never exceeds ~60s, so escalating past it only wastes time.
         const retryAfter = parseInt(res.headers.get("retry-after") || "0", 10);
         const resetSec = parseInt(res.headers.get("x-ratelimit-reset") || "0", 10);
-        const waitSec = Math.min(
-          Math.max(retryAfter, resetSec, Math.min(10 * throttleWaits, 120)) + 5,
-          125,
-        );
-        log(`  Rate limited (wait #${throttleWaits}). Sleeping ${waitSec}s...`);
+        const hinted = Math.max(retryAfter, resetSec);
+        const waitSec = Math.min(hinted > 0 ? hinted + 5 : 60, 65);
+        log(`  Rate limited (wait #${throttleWaits}). Sleeping ${waitSec}s (reset=${resetSec}s)...`);
         await sleep(waitSec * 1000);
         continue;
       }
@@ -649,44 +658,11 @@ function writeBundles(acc) {
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
-// TEMP diagnostic probe: read-only measurement of Henrik's real rate limit.
-// Does NOT download/upload the accumulator or touch the release, so it is safe
-// to run in parallel with a real refresh (own workflow, own concurrency group)
-// without racing on the shared accumulator asset. Fetches the leaderboard + a
-// handful of players' match lists via safeFetch (which, with DEBUG_RATELIMIT=1,
-// logs the raw rate-limit headers) and prints a summary. Remove after tuning.
-async function diagProbe() {
-  const region = REGIONS[0] || "na";
-  const cap = Math.max(1, MAX_PLAYERS_PER_REGION || 8);
-  log(`DIAG_PROBE: measuring Henrik rate limit via ${region} (up to ${cap} match calls)`);
-
-  const lbRes = await safeFetch(`${HENRIK_BASE}/valorant/v3/leaderboard/${region}/pc`);
-  if (!lbRes || !lbRes.ok) { log("DIAG_PROBE: leaderboard fetch failed"); return; }
-  const lbData = await lbRes.json();
-  const players = (lbData.data?.players ?? [])
-    .filter((p) => !p.is_anonymized && p.name && p.tag && p.tier >= 24)
-    .slice(0, cap);
-  log(`DIAG_PROBE: got ${players.length} players; issuing match calls...`);
-
-  let ok = 0, n = 0;
-  for (const p of players) {
-    const r = await safeFetch(
-      `${HENRIK_BASE}/valorant/v3/matches/${region}/${encodeURIComponent(p.name)}/${encodeURIComponent(p.tag)}?filter=competitive&size=1`,
-    );
-    n++;
-    if (r && r.ok) ok++;
-    log(`DIAG_PROBE: call ${n}/${players.length} -> status=${r ? r.status : "null"} (ok so far: ${ok})`);
-  }
-  log(`DIAG_PROBE: done — ${ok}/${n} match calls returned 200.`);
-}
-
 async function main() {
   log("=".repeat(60));
   log("Valorant Data Refresh (database-free)");
   log("=".repeat(60));
   log(`Regions: ${REGIONS.join(", ")} | COMPUTE_ONLY=${COMPUTE_ONLY}`);
-
-  if (process.env.DIAG_PROBE === "1") { await diagProbe(); return; }
 
   const acc = downloadAccumulator();
   pruneAccumulator(acc);
