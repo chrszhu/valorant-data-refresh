@@ -83,11 +83,21 @@ jobs:
           git add data/static
           if git diff --cached --quiet; then
             echo "No bundle changes to commit"
-          else
-            git commit -m "Data refresh: update static bundles"
-            git pull --rebase --autostash origin main || true
-            git push
+            exit 0
           fi
+          # data/static is fully regenerated and authoritative (single writer,
+          # concurrency-guarded), so never merge/conflict on it — just replay our
+          # freshly built bundles on top of the latest main. checkout leaves us on
+          # a detached HEAD, so reset the base to origin/main and push HEAD:main.
+          git fetch origin main
+          git reset --soft origin/main
+          git add data/static
+          if git diff --cached --quiet; then
+            echo "Bundles already up to date on main"
+            exit 0
+          fi
+          git commit -m "Data refresh: update static bundles"
+          git push origin HEAD:main
 
   # Auto-continue: if ANY region didn't finish within its budget (timed out),
   # start a fresh run to pick up where we left off (the accumulator + per-50
