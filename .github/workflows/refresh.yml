@@ -53,7 +53,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FETCH_ONLY: '1'
           REGION: ${{ matrix.region }}
-          MAX_PLAYERS: ${{ inputs.max_players || '500' }}
+          MAX_PLAYERS: ${{ inputs.max_players || '1000' }}
         run: node refresh.mjs
 
   # Build the static bundles from the full accumulator and commit them. Runs even
@@ -112,17 +112,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Continue unfinished work
+        # Inputs are passed via env (never interpolated into the shell body) to
+        # avoid script injection through workflow_dispatch inputs.
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
+          MAX_PLAYERS_IN: ${{ inputs.max_players || '1000' }}
+          ATTEMPT_IN: ${{ inputs.attempt || '1' }}
+          REPO: ${{ github.repository }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "::warning::No GH_PAT secret set — can't auto-continue. The daily"
             echo "::warning::schedule will resume the remaining work instead."
             exit 0
           fi
-          next=$(( ${{ inputs.attempt || '1' }} + 1 ))
+          next=$(( ATTEMPT_IN + 1 ))
           echo "A region did not finish within its budget — continuing (pass $next)."
           gh workflow run refresh.yml \
-            -f max_players="${{ inputs.max_players || '500' }}" \
+            -f max_players="$MAX_PLAYERS_IN" \
             -f attempt="$next" \
-            -R "${{ github.repository }}"
+            -R "$REPO"

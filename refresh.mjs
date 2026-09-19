@@ -153,7 +153,7 @@ function computeArchetype(agents) {
 // ─── Accumulator (raw match store) ───────────────────────────────────────────
 
 function emptyAccumulator() {
-  return { players: [], comps: [], leaderboards: {} };
+  return { players: [], comps: [], leaderboards: {}, progress: {} };
 }
 
 // Drop matches older than PRUNE_DAYS so the accumulator stays bounded even when
@@ -191,7 +191,7 @@ function downloadAccumulator() {
 function loadAccumulatorFile() {
   try {
     const acc = JSON.parse(gunzipSync(readFileSync(ACC_FILE)).toString("utf-8"));
-    acc.players ??= []; acc.comps ??= []; acc.leaderboards ??= {};
+    acc.players ??= []; acc.comps ??= []; acc.leaderboards ??= {}; acc.progress ??= {};
     return acc;
   } catch (err) {
     log(`Failed to read accumulator (${err.message}) — starting empty`);
@@ -252,7 +252,15 @@ async function fetchRegion(region, acc) {
   let zeroStreak = 0; // consecutive players with no new matches (early-stop signal)
   const seen = new Set();
 
-  for (const player of players) {
+  // Resume cursor: if a previous run was killed mid-sweep (e.g. hit the 6h cap at
+  // a high player count), pick up where it left off instead of re-scanning from
+  // the top. Reset to 0 once a full sweep completes so the next run starts fresh.
+  acc.progress ??= {};
+  const startIdx = Math.min(acc.progress[region] || 0, players.length);
+  if (startIdx > 0) log(`  Resuming mid-sweep from player #${startIdx + 1}/${players.length}`);
+
+  for (let i = startIdx; i < players.length; i++) {
+    const player = players[i];
     const matchesBefore = regionMatches;
     try {
       const matchRes = await safeFetch(
@@ -349,25 +357,30 @@ async function fetchRegion(region, acc) {
     }
     playersChecked++;
     if (playersChecked % 25 === 0) {
-      log(`  Progress: ${playersChecked}/${players.length}, ${regionMatches} new matches`);
+      log(`  Progress: ${i + 1}/${players.length}, ${regionMatches} new matches`);
     }
-    // Mid-region checkpoint: persist so a timeout here doesn't throw away work.
+    // Mid-region checkpoint: persist progress + resume cursor so a timeout here
+    // resumes from ~here next run instead of re-scanning from the top.
     if (CHECKPOINT_EVERY > 0 && playersChecked % CHECKPOINT_EVERY === 0) {
+      acc.progress[region] = i + 1;
       saveAccumulator(acc);
       uploadAccumulator();
-      log(`  ⏱ Checkpoint saved at ${playersChecked}/${players.length}`);
+      log(`  ⏱ Checkpoint saved at ${i + 1}/${players.length}`);
     }
     // Early-stop once we hit a wall of already-collected data.
     if (regionMatches === matchesBefore) {
       zeroStreak++;
       if (EARLY_STOP_STREAK > 0 && zeroStreak >= EARLY_STOP_STREAK) {
-        log(`  ⏹ Caught up: ${zeroStreak} players in a row with no new matches — stopping ${region.toUpperCase()} at ${playersChecked}/${players.length}.`);
+        log(`  ⏹ Caught up: ${zeroStreak} players in a row with no new matches — stopping ${region.toUpperCase()} at ${i + 1}/${players.length}.`);
         break;
       }
     } else {
       zeroStreak = 0;
     }
   }
+  // Sweep concluded (finished the list or caught up) — reset the cursor so the
+  // next run starts a fresh top-down sweep and picks up new games from top players.
+  acc.progress[region] = 0;
 
   log(`  ✓ ${region.toUpperCase()}: ${playersChecked} players, ${regionMatches} new matches`);
   return regionMatches;
