@@ -90,6 +90,19 @@ function getHeaders() {
   return headers;
 }
 
+// Diagnostic: dump the raw Henrik rate-limit headers so we can see the real
+// limit / remaining / reset window (not just the computed wait). Gated behind
+// DEBUG_RATELIMIT so it stays silent in normal runs. Logs on every response
+// (200, 429, anything) — matches /ratelimit|rate-limit|retry/i plus status.
+function logRateLimitHeaders(res) {
+  if (!process.env.DEBUG_RATELIMIT) return;
+  const hdrs = [];
+  for (const [k, v] of res.headers.entries()) {
+    if (/ratelimit|rate-limit|retry/i.test(k)) hdrs.push(`${k}=${v}`);
+  }
+  log(`  [rl] status=${res.status} ${hdrs.join(" ") || "(no rate-limit headers present)"}`);
+}
+
 // A 429 is NOT a failure — it just means "come back later". We wait out the
 // server's reset window and retry indefinitely (bounded only by the per-region
 // job timeout), so throttling slows us down but never drops data. Only real
@@ -101,6 +114,7 @@ async function safeFetch(url, maxNetErrors = 5) {
     await sleep(DELAY_MS);
     try {
       const res = await fetch(url, { headers: getHeaders(), cache: "no-store" });
+      logRateLimitHeaders(res);
       if (res.status === 429) {
         throttleWaits++;
         // Prefer the server's own hints; fall back to a growing wait so a long
@@ -635,11 +649,44 @@ function writeBundles(acc) {
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
+// TEMP diagnostic probe: read-only measurement of Henrik's real rate limit.
+// Does NOT download/upload the accumulator or touch the release, so it is safe
+// to run in parallel with a real refresh (own workflow, own concurrency group)
+// without racing on the shared accumulator asset. Fetches the leaderboard + a
+// handful of players' match lists via safeFetch (which, with DEBUG_RATELIMIT=1,
+// logs the raw rate-limit headers) and prints a summary. Remove after tuning.
+async function diagProbe() {
+  const region = REGIONS[0] || "na";
+  const cap = Math.max(1, MAX_PLAYERS_PER_REGION || 8);
+  log(`DIAG_PROBE: measuring Henrik rate limit via ${region} (up to ${cap} match calls)`);
+
+  const lbRes = await safeFetch(`${HENRIK_BASE}/valorant/v3/leaderboard/${region}/pc`);
+  if (!lbRes || !lbRes.ok) { log("DIAG_PROBE: leaderboard fetch failed"); return; }
+  const lbData = await lbRes.json();
+  const players = (lbData.data?.players ?? [])
+    .filter((p) => !p.is_anonymized && p.name && p.tag && p.tier >= 24)
+    .slice(0, cap);
+  log(`DIAG_PROBE: got ${players.length} players; issuing match calls...`);
+
+  let ok = 0, n = 0;
+  for (const p of players) {
+    const r = await safeFetch(
+      `${HENRIK_BASE}/valorant/v3/matches/${region}/${encodeURIComponent(p.name)}/${encodeURIComponent(p.tag)}?filter=competitive&size=1`,
+    );
+    n++;
+    if (r && r.ok) ok++;
+    log(`DIAG_PROBE: call ${n}/${players.length} -> status=${r ? r.status : "null"} (ok so far: ${ok})`);
+  }
+  log(`DIAG_PROBE: done — ${ok}/${n} match calls returned 200.`);
+}
+
 async function main() {
   log("=".repeat(60));
   log("Valorant Data Refresh (database-free)");
   log("=".repeat(60));
   log(`Regions: ${REGIONS.join(", ")} | COMPUTE_ONLY=${COMPUTE_ONLY}`);
+
+  if (process.env.DIAG_PROBE === "1") { await diagProbe(); return; }
 
   const acc = downloadAccumulator();
   pruneAccumulator(acc);
