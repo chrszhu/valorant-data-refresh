@@ -331,7 +331,7 @@ let ECON_DEBUG_DUMPED = false;
 function captureEconomy(match, region, econ) {
   const meta = match?.metadata;
   const matchId = meta?.matchid;
-  if (!matchId || econ.ids.has(matchId)) return 0;
+  if (!matchId) return 0;
 
   const rounds = match?.rounds;
   if (!Array.isArray(rounds) || rounds.length === 0) {
@@ -339,10 +339,20 @@ function captureEconomy(match, region, econ) {
     return 0;
   }
 
+  // Debug dump fires on the first rounds-bearing match regardless of dedup, so a
+  // tiny re-scan can reveal the schema (plant/site/end_type) needed to derive
+  // attack/defense. Trimmed to one player_stats entry to stay readable.
   if (process.env.DEBUG_ECON && !ECON_DEBUG_DUMPED) {
     ECON_DEBUG_DUMPED = true;
-    log(`[econ-debug] first round raw structure:\n${JSON.stringify(rounds[0], null, 2)}`);
+    log(`[econ-debug] round[0] keys: ${Object.keys(rounds[0]).join(", ")}`);
+    const planted = rounds.find((r) => r?.plant_events || r?.bomb_planted || r?.plant);
+    log(`[econ-debug] plant sample: ${JSON.stringify(planted?.plant_events ?? { bomb_planted: planted?.bomb_planted })}`);
+    const r0 = { ...rounds[0] };
+    if (Array.isArray(r0.player_stats)) r0.player_stats = r0.player_stats.slice(0, 1);
+    log(`[econ-debug] round[0] (1 player): ${JSON.stringify(r0)}`);
   }
+
+  if (econ.ids.has(matchId)) return 0; // already stored — skip after debug
 
   const map = meta?.map ?? "";
   const gameStart = meta?.game_start ?? 0;
