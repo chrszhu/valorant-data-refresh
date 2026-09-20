@@ -379,6 +379,10 @@ function captureEconomy(match, region, econ) {
         spent: e?.spent ?? 0,
         remaining: e?.remaining ?? 0,
         loadout_value: e?.loadout_value ?? 0,
+        // Per-round ability casts — best available proxy for "which utility did
+        // they invest in this round" (the API does not itemize ability buys).
+        // Stored raw so later analysis can adapt to Henrik's exact field names.
+        ability_casts: st?.ability_casts ?? null,
         round_won: (team && winningTeam) ? (team === winningTeam ? 1 : 0) : null,
       });
       added++;
@@ -432,6 +436,7 @@ async function fetchRegion(region, acc, econ) {
   for (let i = startIdx; i < players.length; i++) {
     const player = players[i];
     const matchesBefore = regionMatches;
+    const econBefore = econ.rows.length;
     try {
       const matchRes = await safeFetch(
         `${HENRIK_BASE}/valorant/v3/matches/${region}/${encodeURIComponent(player.name)}/${encodeURIComponent(player.tag)}?filter=${MODE}&size=${MATCHES_PER_PLAYER}`,
@@ -444,6 +449,11 @@ async function fetchRegion(region, acc, econ) {
         try {
           if (!match?.metadata || match.metadata.mode_id !== MODE) continue;
           const matchId = match.metadata.matchid;
+          // Capture per-round economy for ANY match not yet in the economy store,
+          // independent of the match-row dedup. This lets a run backfill economy
+          // for matches already in the main accumulator (captureEconomy has its
+          // own dedup so it never double-stores). Self-contained; never throws.
+          captureEconomy(match, region, econ);
           if (existingIds.has(matchId) || seen.has(matchId)) continue;
 
           const mapName = match.metadata.map;
@@ -459,11 +469,6 @@ async function fetchRegion(region, acc, econ) {
           if (!teamResults[team]) continue;
 
           seen.add(matchId);
-
-          // Task C: persist raw per-round buy data for this NEW match (going
-          // forward only — already-collected matches are skipped above, so they
-          // are never reprocessed for economy). Defensive; never throws.
-          captureEconomy(match, region, econ);
 
           let won = false, teamRoundsWon = 0, teamRoundsLost = 0;
           let rounds = match.metadata.rounds_played || 1;
@@ -544,8 +549,10 @@ async function fetchRegion(region, acc, econ) {
       uploadEconStore(econ);
       log(`  ⏱ Checkpoint saved at ${i + 1}/${players.length}`);
     }
-    // Early-stop once we hit a wall of already-collected data.
-    if (regionMatches === matchesBefore) {
+    // Early-stop once we hit a wall of already-collected data — but only when
+    // NEITHER a new match row NOR new economy rows were added, so an economy
+    // backfill (dupe matches, fresh economy) keeps scanning until it's caught up.
+    if (regionMatches === matchesBefore && econ.rows.length === econBefore) {
       zeroStreak++;
       if (EARLY_STOP_STREAK > 0 && zeroStreak >= EARLY_STOP_STREAK) {
         log(`  ⏹ Caught up: ${zeroStreak} players in a row with no new matches — stopping ${region.toUpperCase()} at ${i + 1}/${players.length}.`);

@@ -16,6 +16,14 @@ on:
         description: 'Internal: auto-continue pass counter (leave blank)'
         required: false
         type: string
+      regions:
+        description: 'JSON array of regions to run, e.g. ["na"] (blank = all)'
+        required: false
+        type: string
+      debug_econ:
+        description: 'Set to 1 to dump the first round economy structure once'
+        required: false
+        type: string
 
 # Only one run at a time — all runs share the single accumulator release asset
 # and the Henrik API rate limit. A new run (including an auto-continue) waits for
@@ -38,7 +46,7 @@ jobs:
     timeout-minutes: 350 # just under GitHub's hard 6h per-job cap
     strategy:
       matrix:
-        region: [na, eu, ap, kr, br, latam]
+        region: ${{ fromJSON(inputs.regions || '["na","eu","ap","kr","br","latam"]') }}
       max-parallel: 1
       fail-fast: false
     steps:
@@ -55,6 +63,7 @@ jobs:
           FETCH_ONLY: '1'
           REGION: ${{ matrix.region }}
           MAX_PLAYERS: ${{ inputs.max_players || '1000' }}
+          DEBUG_ECON: ${{ inputs.debug_econ || '' }}
         run: node refresh.mjs
 
   # Build the static bundles from the full accumulator and commit them. Runs even
