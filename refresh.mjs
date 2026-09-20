@@ -20,15 +20,17 @@
  *   HENRIKDEV_API_KEY  Henrik API key
  *   GH_TOKEN           token for `gh` (release download/upload) — GITHUB_TOKEN in CI
  *   MODE               'competitive' (default) or 'swiftplay'. Routes the Henrik
- *                      filter, mode_id check, accumulator release tag, local
- *                      filename, and output bundle dir. Swiftplay keeps a fully
- *                      separate pipeline (own workflow/day) and gets fresh data for
- *                      out-of-rotation maps; it does NOT use the competitive seed.
+ *                      filter, mode_id check, accumulator + economy release tags,
+ *                      local filenames, and output bundle dir. Swiftplay keeps a
+ *                      fully separate pipeline (own workflow/day) and gets fresh
+ *                      data for out-of-rotation maps; it does NOT use the seed.
  *   REGION             optional single region (default: all six)
  *   MAX_PLAYERS        players per region (default 1000, 0 = no cap)
  *   MATCHES_PER_PLAYER recent matches per player (default 20)
  *   COMPUTE_ONLY=1     skip fetching + release; just rebuild bundles from a local
  *                      accumulator.json.gz (if present) + seed. For local testing.
+ *   DEBUG_ECON=1       dump the first parsed round's raw structure once (to confirm
+ *                      Henrik's match.rounds economy shape on a real run).
  */
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
@@ -43,10 +45,10 @@ const ROOT = __dirname;
 // MODE selects which queue this run collects. It routes EVERYTHING that must not
 // collide between the two pipelines: the Henrik `filter` query param, the
 // mode_id acceptance check, the release tag + local filename for the raw match
-// accumulator, and the output bundle dir. Default 'competitive'; the only other
-// supported value is 'swiftplay'. Swiftplay exists to collect fresh data for
-// out-of-rotation maps (Bind/Icebox/…), whose map pool includes every map — so it
-// is kept 100% separate from competitive (own workflow, own day, own assets).
+// accumulator, the per-round economy store tag/file, and the output bundle dir.
+// Default 'competitive'; the only other supported value is 'swiftplay'. Swiftplay
+// exists to collect fresh data for out-of-rotation maps (Bind/Icebox/…), whose
+// map pool includes every map — so it is kept 100% separate from competitive.
 const MODE = process.env.MODE === "swiftplay" ? "swiftplay" : "competitive";
 const IS_SWIFTPLAY = MODE === "swiftplay";
 
@@ -57,6 +59,12 @@ const ACC_ASSET = IS_SWIFTPLAY ? "accumulator-swiftplay.json.gz" : "accumulator.
 const ACC_FILE = resolve(ROOT, ACC_ASSET);
 const SEED_FILE = resolve(ROOT, "seed-agent-map-stats.json");
 const RELEASE_TAG = IS_SWIFTPLAY ? "data-accumulator-swiftplay" : "data-accumulator";
+
+// Task C: per-round economy/buy store — a SEPARATE release asset so the raw
+// round-by-round rows never bloat the match accumulator. Derived from MODE.
+const ECON_ASSET = IS_SWIFTPLAY ? "economy-swiftplay.ndjson.gz" : "economy.ndjson.gz";
+const ECON_FILE = resolve(ROOT, ECON_ASSET);
+const ECON_TAG = IS_SWIFTPLAY ? "economy-accumulator-swiftplay" : "economy-accumulator";
 
 const ALL_REGIONS = ["na", "eu", "ap", "kr", "br", "latam"];
 const OUT_REGIONS = ["all", ...ALL_REGIONS];
@@ -237,9 +245,152 @@ function uploadAccumulator() {
   log("Uploaded accumulator to release");
 }
 
+// ─── Per-round economy store (Task C) ────────────────────────────────────────
+// Henrik v3 `match.rounds[]` already carries per-round buy/economy data at zero
+// extra API cost, but the main pipeline discards it. We persist a compact row per
+// (round × player) to a SEPARATE release asset (ECON_TAG) as gzipped NDJSON so it
+// never bloats the match accumulator. Deduped by match_id, pruned to PRUNE_DAYS by
+// game_start. NO bundle/UI is built from this — it's a raw store for later
+// analysis. GOING-FORWARD only: economy is captured when a match is first added to
+// the match accumulator, so matches already collected are never reprocessed.
+//
+// Store shape held in memory: { rows: [row, …], ids: Set<match_id> }. Each row:
+//   { region, match_id, map, mode, game_start, round, puuid, agent, team,
+//     weapon, armor, spent, remaining, loadout_value, round_won }
+
+function emptyEconStore() {
+  return { rows: [], ids: new Set() };
+}
+
+function loadEconStoreFile() {
+  try {
+    const text = gunzipSync(readFileSync(ECON_FILE)).toString("utf-8");
+    const rows = text.split("\n").filter(Boolean).map((l) => JSON.parse(l));
+    const ids = new Set(rows.map((r) => r.match_id));
+    return { rows, ids };
+  } catch (err) {
+    log(`Failed to read economy store (${err.message}) — starting empty`);
+    return emptyEconStore();
+  }
+}
+
+function downloadEconStore() {
+  try {
+    execSync(`gh release download ${ECON_TAG} -p ${ECON_ASSET} -O "${ECON_FILE}" --clobber`, {
+      stdio: "pipe", cwd: ROOT,
+    });
+    log("Downloaded economy store from release");
+    return loadEconStoreFile();
+  } catch {
+    if (existsSync(ECON_FILE)) {
+      log("Using local economy store");
+      return loadEconStoreFile();
+    }
+    log("No economy store (release or local) — starting empty");
+    return emptyEconStore();
+  }
+}
+
+function pruneEconStore(econ) {
+  if (PRUNE_DAYS <= 0) return;
+  const cutoff = Math.floor(Date.now() / 1000) - PRUNE_DAYS * 86400;
+  const before = econ.rows.length;
+  econ.rows = econ.rows.filter((r) => (r.game_start || 0) >= cutoff);
+  if (econ.rows.length !== before) {
+    econ.ids = new Set(econ.rows.map((r) => r.match_id));
+    log(`Pruned economy >${PRUNE_DAYS}d: rows ${before}->${econ.rows.length}`);
+  }
+}
+
+function saveEconStore(econ) {
+  const ndjson = econ.rows.map((r) => JSON.stringify(r)).join("\n");
+  writeFileSync(ECON_FILE, gzipSync(Buffer.from(ndjson)));
+  const sizeMb = (readFileSync(ECON_FILE).length / 1e6).toFixed(1);
+  log(`Economy store saved: ${econ.rows.length} rows, ${econ.ids.size} matches (${sizeMb} MB gz)`);
+}
+
+function uploadEconStore(econ) {
+  if (COMPUTE_ONLY) return;
+  try {
+    execSync(`gh release view ${ECON_TAG}`, { stdio: "pipe", cwd: ROOT });
+  } catch {
+    // Created lazily on first use — do NOT pre-create the release manually.
+    execSync(`gh release create ${ECON_TAG} -t "Per-round economy accumulator (${MODE})" -n "Deduped per-round buy/economy rows (gzipped NDJSON). Going-forward capture; regenerated weekly."`, {
+      stdio: "inherit", cwd: ROOT,
+    });
+  }
+  execSync(`gh release upload ${ECON_TAG} "${ECON_FILE}" --clobber`, { stdio: "inherit", cwd: ROOT });
+  log("Uploaded economy store to release");
+}
+
+// Defensive parser for match.rounds[]. Uses optional chaining throughout and
+// skips gracefully if rounds/player_stats/economy are missing, so a shape change
+// never crashes a run. DEBUG_ECON dumps the first round's raw structure once so a
+// real GitHub run can confirm the exact Henrik shape.
+let ECON_DEBUG_DUMPED = false;
+function captureEconomy(match, region, econ) {
+  const meta = match?.metadata;
+  const matchId = meta?.matchid;
+  if (!matchId || econ.ids.has(matchId)) return 0;
+
+  const rounds = match?.rounds;
+  if (!Array.isArray(rounds) || rounds.length === 0) {
+    econ.ids.add(matchId); // mark seen so we don't re-scan a rounds-less match
+    return 0;
+  }
+
+  if (process.env.DEBUG_ECON && !ECON_DEBUG_DUMPED) {
+    ECON_DEBUG_DUMPED = true;
+    log(`[econ-debug] first round raw structure:\n${JSON.stringify(rounds[0], null, 2)}`);
+  }
+
+  const map = meta?.map ?? "";
+  const gameStart = meta?.game_start ?? 0;
+  // puuid -> {agent, team} from all_players (rounds carry only puuid).
+  const byPuuid = {};
+  for (const p of (match?.players?.all_players ?? [])) {
+    if (p?.puuid) byPuuid[p.puuid] = { agent: p.character ?? "", team: (p.team ?? "").toLowerCase() };
+  }
+
+  let added = 0;
+  for (let ri = 0; ri < rounds.length; ri++) {
+    const rd = rounds[ri];
+    const winningTeam = (rd?.winning_team ?? "").toString().toLowerCase();
+    const stats = rd?.player_stats;
+    if (!Array.isArray(stats)) continue;
+    for (const st of stats) {
+      const puuid = st?.player_puuid ?? st?.puuid;
+      if (!puuid) continue;
+      const info = byPuuid[puuid] ?? {};
+      const team = info.team ?? "";
+      const e = st?.economy ?? {};
+      econ.rows.push({
+        region,
+        match_id: matchId,
+        map,
+        mode: MODE,
+        game_start: gameStart,
+        round: ri,
+        puuid,
+        agent: info.agent ?? "",
+        team,
+        weapon: e?.weapon?.name ?? e?.weapon?.id ?? "",
+        armor: e?.armor?.name ?? e?.armor?.id ?? "",
+        spent: e?.spent ?? 0,
+        remaining: e?.remaining ?? 0,
+        loadout_value: e?.loadout_value ?? 0,
+        round_won: (team && winningTeam) ? (team === winningTeam ? 1 : 0) : null,
+      });
+      added++;
+    }
+  }
+  econ.ids.add(matchId);
+  return added;
+}
+
 // ─── Fetch one region into the accumulator ───────────────────────────────────
 
-async function fetchRegion(region, acc) {
+async function fetchRegion(region, acc, econ) {
   log(`\n--- ${region.toUpperCase()} ---`);
 
   const lbRes = await safeFetch(`${HENRIK_BASE}/valorant/v3/leaderboard/${region}/pc`);
@@ -308,6 +459,11 @@ async function fetchRegion(region, acc) {
           if (!teamResults[team]) continue;
 
           seen.add(matchId);
+
+          // Task C: persist raw per-round buy data for this NEW match (going
+          // forward only — already-collected matches are skipped above, so they
+          // are never reprocessed for economy). Defensive; never throws.
+          captureEconomy(match, region, econ);
 
           let won = false, teamRoundsWon = 0, teamRoundsLost = 0;
           let rounds = match.metadata.rounds_played || 1;
@@ -384,6 +540,8 @@ async function fetchRegion(region, acc) {
       acc.progress[region] = i + 1;
       saveAccumulator(acc);
       uploadAccumulator();
+      saveEconStore(econ);
+      uploadEconStore(econ);
       log(`  ⏱ Checkpoint saved at ${i + 1}/${players.length}`);
     }
     // Early-stop once we hit a wall of already-collected data.
@@ -673,14 +831,19 @@ async function main() {
   pruneAccumulator(acc);
 
   if (!COMPUTE_ONLY) {
+    // Separate going-forward per-round economy store (Task C) — own release asset.
+    const econ = downloadEconStore();
+    pruneEconStore(econ);
     const start = Date.now();
     let total = 0;
     for (const region of REGIONS) {
-      total += await fetchRegion(region, acc);
+      total += await fetchRegion(region, acc, econ);
       // Persist after each region so a timeout mid-run doesn't lose progress —
-      // the next run resumes from the last saved accumulator.
+      // the next run resumes from the last saved accumulator + economy store.
       saveAccumulator(acc);
       uploadAccumulator();
+      saveEconStore(econ);
+      uploadEconStore(econ);
     }
     log(`\nFetched ${total} new matches in ${((Date.now() - start) / 60000).toFixed(1)} min`);
   }
