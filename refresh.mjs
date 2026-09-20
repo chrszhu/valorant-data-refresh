@@ -43,14 +43,7 @@ const ALL_REGIONS = ["na", "eu", "ap", "kr", "br", "latam"];
 const OUT_REGIONS = ["all", ...ALL_REGIONS];
 const REGIONS = process.env.REGION ? [process.env.REGION] : ALL_REGIONS;
 const HENRIK_BASE = "https://api.henrikdev.xyz";
-// Henrik's real limit (confirmed from response headers on the runner):
-//   ratelimit-policy: "per1min"; q=30; w=60  →  30 requests per fixed 60s window,
-//   x-ratelimit-limit=30, x-ratelimit-reset = seconds left in the current window.
-// 2100ms ≈ 28.5 req/min stays just under 30/min with headroom for clock jitter and
-// the fixed-window edge, so a DEDICATED key never self-inflicts a 429 in steady
-// state. (The 429 storms we saw come from the key being SHARED/over-subscribed;
-// pacing alone can't fix that — see README/handoff about a dedicated batch key.)
-const DELAY_MS = parseInt(process.env.DELAY_MS || "2100", 10);
+const DELAY_MS = 2500;
 const MAX_PLAYERS_PER_REGION = parseInt(process.env.MAX_PLAYERS || "1000", 10);
 const MATCHES_PER_PLAYER = parseInt(process.env.MATCHES_PER_PLAYER || "20", 10);
 // Save + upload the accumulator mid-region every N players so a job killed
@@ -97,19 +90,6 @@ function getHeaders() {
   return headers;
 }
 
-// Diagnostic: dump the raw Henrik rate-limit headers so we can see the real
-// limit / remaining / reset window (not just the computed wait). Gated behind
-// DEBUG_RATELIMIT so it stays silent in normal runs. Logs on every response
-// (200, 429, anything) — matches /ratelimit|rate-limit|retry/i plus status.
-function logRateLimitHeaders(res) {
-  if (!process.env.DEBUG_RATELIMIT) return;
-  const hdrs = [];
-  for (const [k, v] of res.headers.entries()) {
-    if (/ratelimit|rate-limit|retry/i.test(k)) hdrs.push(`${k}=${v}`);
-  }
-  log(`  [rl] status=${res.status} ${hdrs.join(" ") || "(no rate-limit headers present)"}`);
-}
-
 // A 429 is NOT a failure — it just means "come back later". We wait out the
 // server's reset window and retry indefinitely (bounded only by the per-region
 // job timeout), so throttling slows us down but never drops data. Only real
@@ -121,20 +101,17 @@ async function safeFetch(url, maxNetErrors = 5) {
     await sleep(DELAY_MS);
     try {
       const res = await fetch(url, { headers: getHeaders(), cache: "no-store" });
-      logRateLimitHeaders(res);
       if (res.status === 429) {
         throttleWaits++;
-        // Henrik uses a FIXED 60s window (ratelimit-policy: per1min, w=60). The
-        // only useful hint is x-ratelimit-reset = seconds left in the current
-        // window (retry-after is not sent). Once that elapses the full 30-request
-        // quota refills, so we just wait out the window (+ a small skew buffer)
-        // and retry — clamped to ~65s. No growing/120s backoff: the real reset
-        // never exceeds ~60s, so escalating past it only wastes time.
+        // Prefer the server's own hints; fall back to a growing wait so a long
+        // throttle backs off instead of hammering (10s → 20s → … capped 120s).
         const retryAfter = parseInt(res.headers.get("retry-after") || "0", 10);
         const resetSec = parseInt(res.headers.get("x-ratelimit-reset") || "0", 10);
-        const hinted = Math.max(retryAfter, resetSec);
-        const waitSec = Math.min(hinted > 0 ? hinted + 5 : 60, 65);
-        log(`  Rate limited (wait #${throttleWaits}). Sleeping ${waitSec}s (reset=${resetSec}s)...`);
+        const waitSec = Math.min(
+          Math.max(retryAfter, resetSec, Math.min(10 * throttleWaits, 120)) + 5,
+          125,
+        );
+        log(`  Rate limited (wait #${throttleWaits}). Sleeping ${waitSec}s...`);
         await sleep(waitSec * 1000);
         continue;
       }
