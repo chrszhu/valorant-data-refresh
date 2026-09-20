@@ -362,17 +362,40 @@ function captureEconomy(match, region, econ) {
     if (p?.puuid) byPuuid[p.puuid] = { agent: p.character ?? "", team: (p.team ?? "").toLowerCase() };
   }
 
+  // Attack/defense per round: whoever plants the spike is attacking. Sides are
+  // fixed within a half, so one planted round per half pins both halves; the
+  // per-round plant (when present) also handles overtime correctly.
+  let atkFirst = null, atkSecond = null;
+  for (let ri = 0; ri < rounds.length; ri++) {
+    const t = rounds[ri]?.plant_events?.planted_by?.team;
+    if (!t) continue;
+    const tl = t.toLowerCase();
+    if (ri < 12 && !atkFirst) atkFirst = tl;
+    else if (ri >= 12 && ri < 24 && !atkSecond) atkSecond = tl;
+  }
+  const flip = (t) => (t === "red" ? "blue" : t === "blue" ? "red" : null);
+  if (atkFirst && !atkSecond) atkSecond = flip(atkFirst);
+  if (atkSecond && !atkFirst) atkFirst = flip(atkSecond);
+  const attackerOf = (ri) => {
+    const direct = rounds[ri]?.plant_events?.planted_by?.team;
+    if (direct) return direct.toLowerCase();
+    if (ri < 12) return atkFirst;
+    if (ri < 24) return atkSecond;
+    return null; // overtime round with no plant — side unknown
+  };
+
   let added = 0;
   for (let ri = 0; ri < rounds.length; ri++) {
     const rd = rounds[ri];
     const winningTeam = (rd?.winning_team ?? "").toString().toLowerCase();
+    const attacker = attackerOf(ri);
     const stats = rd?.player_stats;
     if (!Array.isArray(stats)) continue;
     for (const st of stats) {
       const puuid = st?.player_puuid ?? st?.puuid;
       if (!puuid) continue;
       const info = byPuuid[puuid] ?? {};
-      const team = info.team ?? "";
+      const team = (st?.player_team ?? info.team ?? "").toLowerCase();
       const e = st?.economy ?? {};
       econ.rows.push({
         region,
@@ -384,15 +407,15 @@ function captureEconomy(match, region, econ) {
         puuid,
         agent: info.agent ?? "",
         team,
+        // atk = this player's team was attacking that round (planted the spike),
+        // def = defending. Enables offense/defense splits (buys differ by side,
+        // and sides swap at R13). "" when the side can't be determined.
+        side: attacker ? (team === attacker ? "atk" : "def") : "",
         weapon: e?.weapon?.name ?? e?.weapon?.id ?? "",
         armor: e?.armor?.name ?? e?.armor?.id ?? "",
         spent: e?.spent ?? 0,
         remaining: e?.remaining ?? 0,
         loadout_value: e?.loadout_value ?? 0,
-        // Per-round ability casts — best available proxy for "which utility did
-        // they invest in this round" (the API does not itemize ability buys).
-        // Stored raw so later analysis can adapt to Henrik's exact field names.
-        ability_casts: st?.ability_casts ?? null,
         round_won: (team && winningTeam) ? (team === winningTeam ? 1 : 0) : null,
       });
       added++;
