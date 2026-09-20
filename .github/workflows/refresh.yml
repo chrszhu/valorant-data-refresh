@@ -2,9 +2,10 @@ name: Valorant Data Refresh
 
 on:
   schedule:
-    # Daily, 06:00 UTC. Keeps the meta up to date within a day. The accumulator
-    # dedups matches and auto-prunes old ones, so daily runs stay cheap + bounded.
-    - cron: '0 6 * * *'
+    # Weekly, Mondays 06:00 UTC. Keeps the competitive meta fresh week to week.
+    # The accumulator dedups matches and auto-prunes old ones, so runs stay cheap
+    # + bounded. (Swiftplay has its own separate weekly run on Thursdays.)
+    - cron: '0 6 * * 1'
   workflow_dispatch:
     inputs:
       max_players:
@@ -102,7 +103,7 @@ jobs:
   # Auto-continue: if ANY region didn't finish within its budget (timed out),
   # start a fresh run to pick up where we left off (the accumulator + per-50
   # checkpoints mean it resumes, not restarts). Loops until a pass where every
-  # region completes, then stops — the daily schedule takes over from there.
+  # region completes, then stops — the weekly schedule takes over from there.
   # Capped at 8 passes as a runaway guard. Requires a GH_PAT secret because the
   # default GITHUB_TOKEN is not allowed to trigger another workflow run.
   continue:
@@ -121,7 +122,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
-            echo "::warning::No GH_PAT secret set — can't auto-continue. The daily"
+            echo "::warning::No GH_PAT secret set — can't auto-continue. The weekly"
             echo "::warning::schedule will resume the remaining work instead."
             exit 0
           fi
