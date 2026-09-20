@@ -19,6 +19,11 @@
  * Env:
  *   HENRIKDEV_API_KEY  Henrik API key
  *   GH_TOKEN           token for `gh` (release download/upload) — GITHUB_TOKEN in CI
+ *   MODE               'competitive' (default) or 'swiftplay'. Routes the Henrik
+ *                      filter, mode_id check, accumulator release tag, local
+ *                      filename, and output bundle dir. Swiftplay keeps a fully
+ *                      separate pipeline (own workflow/day) and gets fresh data for
+ *                      out-of-rotation maps; it does NOT use the competitive seed.
  *   REGION             optional single region (default: all six)
  *   MAX_PLAYERS        players per region (default 1000, 0 = no cap)
  *   MATCHES_PER_PLAYER recent matches per player (default 20)
@@ -34,10 +39,24 @@ import { execSync } from "child_process";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = __dirname;
-const OUT_DIR = resolve(ROOT, "data", "static");
-const ACC_FILE = resolve(ROOT, "accumulator.json.gz");
+
+// MODE selects which queue this run collects. It routes EVERYTHING that must not
+// collide between the two pipelines: the Henrik `filter` query param, the
+// mode_id acceptance check, the release tag + local filename for the raw match
+// accumulator, and the output bundle dir. Default 'competitive'; the only other
+// supported value is 'swiftplay'. Swiftplay exists to collect fresh data for
+// out-of-rotation maps (Bind/Icebox/…), whose map pool includes every map — so it
+// is kept 100% separate from competitive (own workflow, own day, own assets).
+const MODE = process.env.MODE === "swiftplay" ? "swiftplay" : "competitive";
+const IS_SWIFTPLAY = MODE === "swiftplay";
+
+const OUT_DIR = resolve(ROOT, "data", IS_SWIFTPLAY ? "static-swiftplay" : "static");
+// Local filenames differ per mode so a machine/runner that somehow runs both
+// modes back-to-back can't clobber the other mode's downloaded store.
+const ACC_ASSET = IS_SWIFTPLAY ? "accumulator-swiftplay.json.gz" : "accumulator.json.gz";
+const ACC_FILE = resolve(ROOT, ACC_ASSET);
 const SEED_FILE = resolve(ROOT, "seed-agent-map-stats.json");
-const RELEASE_TAG = "data-accumulator";
+const RELEASE_TAG = IS_SWIFTPLAY ? "data-accumulator-swiftplay" : "data-accumulator";
 
 const ALL_REGIONS = ["na", "eu", "ap", "kr", "br", "latam"];
 const OUT_REGIONS = ["all", ...ALL_REGIONS];
@@ -52,8 +71,8 @@ const MATCHES_PER_PLAYER = parseInt(process.env.MATCHES_PER_PLAYER || "20", 10);
 const CHECKPOINT_EVERY = parseInt(process.env.CHECKPOINT_EVERY || "50", 10);
 // Early-stop: if this many players in a row yield ZERO new matches, we've caught
 // up to already-collected data for this region — stop scanning to save API calls.
-// The first run (empty store) never triggers it; daily runs stop quickly once the
-// day's new games are in. 0 = disabled (always scan the full player list).
+// The first run (empty store) never triggers it; scheduled runs stop quickly once
+// the period's new games are in. 0 = disabled (always scan the full player list).
 const EARLY_STOP_STREAK = parseInt(process.env.EARLY_STOP_STREAK || "40", 10);
 const COMPUTE_ONLY = process.env.COMPUTE_ONLY === "1";
 // FETCH_ONLY: pull matches into the accumulator but don't compute/write bundles.
@@ -173,7 +192,7 @@ function downloadAccumulator() {
   // Try the release first (works in CI for every mode). Fall back to a local
   // file (local testing), else start empty.
   try {
-    execSync(`gh release download ${RELEASE_TAG} -p accumulator.json.gz -O "${ACC_FILE}" --clobber`, {
+    execSync(`gh release download ${RELEASE_TAG} -p ${ACC_ASSET} -O "${ACC_FILE}" --clobber`, {
       stdio: "pipe", cwd: ROOT,
     });
     log("Downloaded accumulator from release");
@@ -264,7 +283,7 @@ async function fetchRegion(region, acc) {
     const matchesBefore = regionMatches;
     try {
       const matchRes = await safeFetch(
-        `${HENRIK_BASE}/valorant/v3/matches/${region}/${encodeURIComponent(player.name)}/${encodeURIComponent(player.tag)}?filter=competitive&size=${MATCHES_PER_PLAYER}`,
+        `${HENRIK_BASE}/valorant/v3/matches/${region}/${encodeURIComponent(player.name)}/${encodeURIComponent(player.tag)}?filter=${MODE}&size=${MATCHES_PER_PLAYER}`,
       );
       if (!matchRes || !matchRes.ok) { playersChecked++; continue; }
       const matchData = await matchRes.json();
@@ -272,7 +291,7 @@ async function fetchRegion(region, acc) {
 
       for (const match of matches) {
         try {
-          if (!match?.metadata || match.metadata.mode_id !== "competitive") continue;
+          if (!match?.metadata || match.metadata.mode_id !== MODE) continue;
           const matchId = match.metadata.matchid;
           if (existingIds.has(matchId) || seen.has(matchId)) continue;
 
@@ -311,7 +330,7 @@ async function fetchRegion(region, acc) {
           const anchorTier = rosterTiers.length ? Math.max(...rosterTiers) : (player.tier ?? 0);
 
           acc.players.push({
-            region, match_id: matchId, map: mapName, mode_id: "competitive",
+            region, match_id: matchId, map: mapName, mode_id: MODE,
             game_start: gameStart, total_rounds: rounds,
             puuid: actualPlayer.puuid, character: actualPlayer.character,
             agent_image_url: actualPlayer.assets?.agent?.small ?? "",
@@ -394,11 +413,20 @@ const PERF_KEYS = [
   "total_e_casts", "total_x_casts", "total_econ_spent", "total_loadout_value",
 ];
 
+// The seed is a COMPETITIVE-only all-time aggregate. Swiftplay bundles are built
+// purely from fresh swiftplay data (its map pool already includes retired maps —
+// that's the whole point), so we leave SEED empty for swiftplay. An empty SEED
+// makes every seedRows() call return [], cleanly disabling the fallback for all
+// consumers (map stats, abilities, comps, status) without touching their logic.
 let SEED = [];
-try {
-  SEED = JSON.parse(readFileSync(SEED_FILE, "utf-8"));
-} catch {
-  log("No seed file found — retired maps will be empty until fresh data arrives");
+if (IS_SWIFTPLAY) {
+  log("MODE=swiftplay: skipping competitive seed — bundles use fresh data only");
+} else {
+  try {
+    SEED = JSON.parse(readFileSync(SEED_FILE, "utf-8"));
+  } catch {
+    log("No seed file found — retired maps will be empty until fresh data arrives");
+  }
 }
 
 // Seed rows for a region. "all" aggregates the per-region rows (they carry perf).
@@ -514,7 +542,7 @@ function mergeAbilityStats(region, minTier, players) {
   const isAll = region === "all";
   const agg = {};
   for (const p of players) {
-    if (!(isAll || p.region === region) || p.mode_id !== "competitive") continue;
+    if (!(isAll || p.region === region) || p.mode_id !== MODE) continue;
     if ((p.current_tier || 0) < minTier) continue;
     const a = (agg[p.character] ??= { character: p.character, img: "", games: 0, rd: 0, c: 0, q: 0, e: 0, x: 0 });
     if (p.agent_image_url && !a.img) a.img = p.agent_image_url;
@@ -580,7 +608,7 @@ function computeTeamComps(region, comps, players) {
 
 function computeStatus(region, players, updatedAt) {
   const isAll = region === "all";
-  const rp = players.filter((p) => (isAll || p.region === region) && p.mode_id === "competitive");
+  const rp = players.filter((p) => (isAll || p.region === region) && p.mode_id === MODE);
   const matchIds = new Set(rp.map((p) => p.match_id));
   const starts = rp.map((p) => p.game_start).filter((n) => n > 0);
   const recent = rp.filter((p) => p.game_start >= 1735689600); // >= 2025-01-01
@@ -639,7 +667,7 @@ async function main() {
   log("=".repeat(60));
   log("Valorant Data Refresh (database-free)");
   log("=".repeat(60));
-  log(`Regions: ${REGIONS.join(", ")} | COMPUTE_ONLY=${COMPUTE_ONLY}`);
+  log(`Regions: ${REGIONS.join(", ")} | MODE=${MODE} | COMPUTE_ONLY=${COMPUTE_ONLY}`);
 
   const acc = downloadAccumulator();
   pruneAccumulator(acc);
