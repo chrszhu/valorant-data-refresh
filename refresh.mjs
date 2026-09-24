@@ -65,6 +65,13 @@ const RELEASE_TAG = IS_SWIFTPLAY ? "data-accumulator-swiftplay" : "data-accumula
 const ECON_ASSET = IS_SWIFTPLAY ? "economy-swiftplay.ndjson.gz" : "economy.ndjson.gz";
 const ECON_FILE = resolve(ROOT, ECON_ASSET);
 const ECON_TAG = IS_SWIFTPLAY ? "economy-accumulator-swiftplay" : "economy-accumulator";
+// The per-round economy store is OFF by default: it captures round×player rows
+// for every match, which grew large enough to exceed V8's max string length in
+// saveEconStore and crash the whole run (breaking BOTH competitive + swiftplay).
+// It is opt-in (CAPTURE_ECON=1) for buy-pattern analysis, and hard-capped so it
+// can never blow the string limit again.
+const CAPTURE_ECON = process.env.CAPTURE_ECON === "1";
+const MAX_ECON_ROWS = parseInt(process.env.MAX_ECON_ROWS || "800000", 10);
 
 const ALL_REGIONS = ["na", "eu", "ap", "kr", "br", "latam"];
 const OUT_REGIONS = ["all", ...ALL_REGIONS];
@@ -275,6 +282,7 @@ function loadEconStoreFile() {
 }
 
 function downloadEconStore() {
+  if (!CAPTURE_ECON) return emptyEconStore();
   try {
     execSync(`gh release download ${ECON_TAG} -p ${ECON_ASSET} -O "${ECON_FILE}" --clobber`, {
       stdio: "pipe", cwd: ROOT,
@@ -292,7 +300,7 @@ function downloadEconStore() {
 }
 
 function pruneEconStore(econ) {
-  if (PRUNE_DAYS <= 0) return;
+  if (!CAPTURE_ECON || PRUNE_DAYS <= 0) return;
   const cutoff = Math.floor(Date.now() / 1000) - PRUNE_DAYS * 86400;
   const before = econ.rows.length;
   econ.rows = econ.rows.filter((r) => (r.game_start || 0) >= cutoff);
@@ -303,14 +311,29 @@ function pruneEconStore(econ) {
 }
 
 function saveEconStore(econ) {
-  const ndjson = econ.rows.map((r) => JSON.stringify(r)).join("\n");
-  writeFileSync(ECON_FILE, gzipSync(Buffer.from(ndjson)));
+  if (!CAPTURE_ECON) return;
+  // Hard cap: keep only the most recent MAX_ECON_ROWS rows (by game_start) so the
+  // serialized NDJSON can never exceed V8's ~512MB max string length. Without this
+  // the join() below threw "Invalid string length" and killed the run.
+  if (econ.rows.length > MAX_ECON_ROWS) {
+    econ.rows.sort((a, b) => (b.game_start || 0) - (a.game_start || 0));
+    econ.rows = econ.rows.slice(0, MAX_ECON_ROWS);
+    econ.ids = new Set(econ.rows.map((r) => r.match_id));
+    log(`Economy store capped to newest ${MAX_ECON_ROWS} rows`);
+  }
+  // Build the gzip incrementally (chunked) rather than one giant string, as a
+  // second guard against the string-length limit.
+  const parts = [];
+  for (let i = 0; i < econ.rows.length; i += 20000) {
+    parts.push(Buffer.from(econ.rows.slice(i, i + 20000).map((r) => JSON.stringify(r)).join("\n") + "\n"));
+  }
+  writeFileSync(ECON_FILE, gzipSync(Buffer.concat(parts)));
   const sizeMb = (readFileSync(ECON_FILE).length / 1e6).toFixed(1);
   log(`Economy store saved: ${econ.rows.length} rows, ${econ.ids.size} matches (${sizeMb} MB gz)`);
 }
 
 function uploadEconStore(econ) {
-  if (COMPUTE_ONLY) return;
+  if (!CAPTURE_ECON || COMPUTE_ONLY) return;
   try {
     execSync(`gh release view ${ECON_TAG}`, { stdio: "pipe", cwd: ROOT });
   } catch {
@@ -329,6 +352,7 @@ function uploadEconStore(econ) {
 // real GitHub run can confirm the exact Henrik shape.
 let ECON_DEBUG_DUMPED = false;
 function captureEconomy(match, region, econ) {
+  if (!CAPTURE_ECON) return 0;
   const meta = match?.metadata;
   const matchId = meta?.matchid;
   if (!matchId) return 0;
