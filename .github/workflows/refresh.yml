@@ -46,7 +46,11 @@ jobs:
     timeout-minutes: 350 # just under GitHub's hard 6h per-job cap
     strategy:
       matrix:
-        region: ${{ fromJSON(inputs.regions || '["na","eu","ap","kr","br","latam"]') }}
+        # Competitive collection is NA-only: the shared Henrik key is too throttled
+        # to cover all six regions within the per-job budget (six sequential ~5h
+        # jobs pushed each run past 30h and kept timing out). Override `regions`
+        # on a manual run to backfill another region on demand.
+        region: ${{ fromJSON(inputs.regions || '["na"]') }}
       max-parallel: 1
       fail-fast: false
     steps:
@@ -140,7 +144,14 @@ jobs:
           fi
           next=$(( ATTEMPT_IN + 1 ))
           echo "A region did not finish within its budget — continuing (pass $next)."
-          gh workflow run refresh.yml \
-            -f max_players="$MAX_PLAYERS_IN" \
-            -f attempt="$next" \
-            -R "$REPO"
+          # A missing/expired GH_PAT must NOT fail the whole run — the weekly
+          # schedule resumes from the saved accumulator either way. So treat a
+          # failed dispatch (e.g. HTTP 401 Bad credentials) as a soft warning.
+          if ! gh workflow run refresh.yml \
+                -f max_players="$MAX_PLAYERS_IN" \
+                -f attempt="$next" \
+                -R "$REPO"; then
+            echo "::warning::Auto-continue dispatch failed (GH_PAT invalid or expired?)."
+            echo "::warning::The weekly schedule will resume the remaining work instead."
+            exit 0
+          fi

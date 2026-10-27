@@ -74,8 +74,12 @@ const CAPTURE_ECON = process.env.CAPTURE_ECON === "1";
 const MAX_ECON_ROWS = parseInt(process.env.MAX_ECON_ROWS || "800000", 10);
 
 const ALL_REGIONS = ["na", "eu", "ap", "kr", "br", "latam"];
-const OUT_REGIONS = ["all", ...ALL_REGIONS];
-const REGIONS = process.env.REGION ? [process.env.REGION] : ALL_REGIONS;
+// The competitive pipeline now collects NA only (the shared Henrik key is too
+// throttled to cover six regions within the per-job budget — six sequential
+// ~5h region jobs pushed each run past 30h and kept timing/erroring out). So we
+// only emit the bundles the site serves: "all" (== NA now) and "na".
+const OUT_REGIONS = ["all", "na"];
+const REGIONS = process.env.REGION ? [process.env.REGION] : ["na"];
 const HENRIK_BASE = "https://api.henrikdev.xyz";
 const DELAY_MS = 2500;
 const MAX_PLAYERS_PER_REGION = parseInt(process.env.MAX_PLAYERS || "1000", 10);
@@ -239,16 +243,52 @@ function saveAccumulator(acc) {
   log(`Accumulator saved: ${acc.players.length} players, ${acc.comps.length} comps (${sizeMb} MB gz)`);
 }
 
+// Run a shell command, retrying on transient failures (network blips, 5xx from
+// the GitHub API). Returns stdout; throws the last error once retries are spent.
+function sh(cmd, { retries = 4 } = {}) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return execSync(cmd, { stdio: "pipe", cwd: ROOT, encoding: "utf-8" });
+    } catch (err) {
+      if (attempt > retries) throw err;
+      const msg = ((err.stderr || "") + (err.message || "")).trim().split("\n").pop();
+      log(`  shell retry (${attempt}/${retries}) after: ${msg}`);
+      try { execSync(`sleep ${5 * attempt}`); } catch { /* ignore */ }
+    }
+  }
+}
+
+// Upload a file as a release asset, resilient to the two failure modes that used
+// to crash a run after hours of work:
+//   1. a transient `gh release view` blip was treated as "release missing", so it
+//      tried to CREATE an existing release and died on HTTP 422 "already exists";
+//   2. no retry on transient network errors during the final upload.
+// We skip the view-gate entirely: try the upload, and only if the release truly
+// doesn't exist do we create it (tolerating a concurrent create), then re-upload.
+function uploadAsset(tag, file, title, notes) {
+  const upload = () => sh(`gh release upload ${tag} "${file}" --clobber`);
+  try {
+    upload();
+    return;
+  } catch (err) {
+    const msg = (err.stderr || "") + (err.message || "");
+    if (!/release not found|not found|no release|release .* not found/i.test(msg)) throw err;
+  }
+  try {
+    sh(`gh release create ${tag} -t ${JSON.stringify(title)} -n ${JSON.stringify(notes)}`, { retries: 2 });
+  } catch (err) {
+    const msg = (err.stderr || "") + (err.message || "");
+    if (!/already exists/i.test(msg)) throw err; // a race/transient created it — fine
+  }
+  upload();
+}
+
 function uploadAccumulator() {
   if (COMPUTE_ONLY) return;
-  try {
-    execSync(`gh release view ${RELEASE_TAG}`, { stdio: "pipe", cwd: ROOT });
-  } catch {
-    execSync(`gh release create ${RELEASE_TAG} -t "Raw match accumulator" -n "Deduped raw match history. Regenerated weekly."`, {
-      stdio: "inherit", cwd: ROOT,
-    });
-  }
-  execSync(`gh release upload ${RELEASE_TAG} "${ACC_FILE}" --clobber`, { stdio: "inherit", cwd: ROOT });
+  uploadAsset(
+    RELEASE_TAG, ACC_FILE,
+    "Raw match accumulator", "Deduped raw match history. Regenerated weekly."
+  );
   log("Uploaded accumulator to release");
 }
 
@@ -334,15 +374,11 @@ function saveEconStore(econ) {
 
 function uploadEconStore(econ) {
   if (!CAPTURE_ECON || COMPUTE_ONLY) return;
-  try {
-    execSync(`gh release view ${ECON_TAG}`, { stdio: "pipe", cwd: ROOT });
-  } catch {
-    // Created lazily on first use — do NOT pre-create the release manually.
-    execSync(`gh release create ${ECON_TAG} -t "Per-round economy accumulator (${MODE})" -n "Deduped per-round buy/economy rows (gzipped NDJSON). Going-forward capture; regenerated weekly."`, {
-      stdio: "inherit", cwd: ROOT,
-    });
-  }
-  execSync(`gh release upload ${ECON_TAG} "${ECON_FILE}" --clobber`, { stdio: "inherit", cwd: ROOT });
+  uploadAsset(
+    ECON_TAG, ECON_FILE,
+    `Per-round economy accumulator (${MODE})`,
+    "Deduped per-round buy/economy rows (gzipped NDJSON). Going-forward capture; regenerated weekly."
+  );
   log("Uploaded economy store to release");
 }
 
